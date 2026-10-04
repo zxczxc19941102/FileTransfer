@@ -1,7 +1,6 @@
 """
 局域网文件互传工具（电脑端服务程序）
 ==================================
-1
 功能概述：
     1. 电脑端运行本程序，自动获取本机局域网 IP、随机分配可用端口，启动本地 HTTP 文件服务；
     2. 自动生成二维码（内容为 http://内网IP:端口），在 tkinter 窗口展示（无 tkinter 时打印到控制台）；
@@ -41,6 +40,10 @@ from starlette.concurrency import run_in_threadpool
 # ==========================================================================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # 程序所在目录
+# 打包成 exe 后 __file__ 指向 PyInstaller 的临时解压目录，必须改用 exe 所在目录，
+# 否则上传的文件会存进临时目录，程序一关就丢失。
+if getattr(sys, "frozen", False):
+    BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")  # 文件保存目录（需求：同目录 uploads）
 QR_PATH = os.path.join(BASE_DIR, "lan_qrcode.png")  # 二维码图片路径
 MAX_UPLOAD_MB = 2048  # 单文件大小上限（MB），防止超大文件占用磁盘
@@ -544,8 +547,19 @@ def start_server(host: str, port: int):
     return server, thread
 
 
+def ensure_std_streams() -> None:
+    """打包成"无控制台"exe 后，sys.stdout / sys.stderr 会是 None，
+    此时 print 和 uvicorn 的日志处理器都会直接抛异常。
+    这里统一兜底到 os.devnull，保证双击 exe 也能正常运行。"""
+    for name in ("stdout", "stderr"):
+        if getattr(sys, name, None) is None:
+            setattr(sys, name, open(os.devnull, "w", encoding="utf-8"))
+
+
 def main() -> None:
     global SERVER_IP, SERVER_PORT, MAX_UPLOAD_MB
+
+    ensure_std_streams()  # 必须在任何输出之前执行
 
     # Windows 控制台按 UTF-8 输出，避免中文乱码
     for stream in (sys.stdout, sys.stderr):

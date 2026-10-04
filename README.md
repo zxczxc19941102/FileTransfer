@@ -64,3 +64,79 @@ python main.py --no-browser    # 启动时不自动打开浏览器
 4. **上传大文件失败**：默认上限 2048 MB，用 `--max-size` 调大；超限返回 413 并自动删除未完成的文件。
 5. **窗口不弹出来**：当前 Python 缺少 tkinter 时会降级，改用 `python main.py --no-gui`，控制台会打印字符二维码，同时二维码图片保存为程序目录下的 `lan_qrcode.png`。
 6. **手机之间互相打不开**：路由器开启「AP 隔离 / 客户端隔离」时需在路由器中关闭。
+## 七、打包成 exe（无黑框窗口 + UPX 压缩 + 数字签名）
+
+### 1. 一次性准备
+
+```bash
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+.venv\Scripts\pip install pyinstaller -i https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+UPX 压缩工具已放在 `tools\upx-5.2.1-win64\`（若缺失会自动跳过压缩，不影响打包）。
+
+### 2. 一键打包
+
+```bash
+.venv\Scripts\python.exe build.py
+```
+
+产物：`dist\FileTransfer.exe`，**双击不会出现命令提示符黑框**，只显示二维码窗口。
+
+- `--noconsole`：去掉控制台边框
+- `--upx-dir`：用 UPX 压缩内部的 python314.dll 与各 `.pyd`，实测体积从 **26.8 MB 降到 21.6 MB（-19.5%）**
+- 上传文件保存在 **exe 同目录的 `uploads\`** 文件夹（打包后路径已修正，不会存到临时目录）
+
+### 3. 免费数字签名
+
+签名用的证书由脚本自动生成（自签名，无需付费申请）：
+
+```bash
+powershell -NoProfile -ExecutionPolicy Bypass -File make_cert.ps1   # 生成/复用证书
+powershell -NoProfile -ExecutionPolicy Bypass -File sign.ps1       # 给 exe 签名
+```
+
+- 证书：`CN=FileTransfer Local`，RSA 3072 / SHA256，用途为**代码签名**，有效期 3 年
+- 已自动加 **DigiCert 时间戳**（到 2037 年），证书过期后签名依然有效
+- 产物：`tools\FileTransfer-CodeSign.cer` / `.pfx`（密码见 `tools\pfx-password.txt`）
+
+**消除本机"未知发布者"提示**（只需做一次）：
+
+1. 双击 `tools\FileTransfer-CodeSign.cer`
+2. 选择「安装证书」→「当前用户」
+3. 选择「将所有的证书放入下列存储」→「受信任的根证书颁发机构」→ 完成
+4. 再双击 `dist\FileTransfer.exe`，签名状态变为 `Valid`
+
+### 签名方案说明（重要）
+
+| 方案 | 费用 | 本机提示 | 他人电脑提示 |
+| --- | --- | --- | --- |
+| 自签名（本方案） | 免费 | 无提示 | 仍提示未知发布者 |
+| SignPath Foundation | 免费（限公开开源项目，需审核） | 无提示 | 无提示 |
+| 商业 OV/EV 证书 | 每年数百美元 | 无提示 | 无提示 |
+
+也就是说：**免费方案只能做到"自己电脑不提示"**。要让任何人都看到可信发布者，需走 SignPath Foundation 申请或购买商业证书。
+## 八、换新电脑继续开发
+
+```bash
+git clone https://github.com/zxczxc19941102/FileTransfer.git
+cd FileTransfer
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+.venv\Scripts\pip install pyinstaller -i https://pypi.tuna.tsinghua.edu.cn/simple
+.venv\Scripts\python.exe main.py
+```
+
+仓库内已包含下列文件，**无需额外准备**：
+
+| 文件 | 用途 |
+| --- | --- |
+| `tools\upx-5.2.1-win64\upx.exe` | UPX 压缩器，打包时自动调用 |
+| `tools\FileTransfer-CodeSign.pfx` | 代码签名证书（密码见 `tools\pfx-password.txt`） |
+| `tools\FileTransfer-CodeSign.cer` | 公钥证书，装到本机受信任根后 exe 显示为已签名 |
+| `tools\cert-thumbprint.txt` | 证书指纹，`sign.ps1` 用它定位证书 |
+
+因此新电脑上执行 `build.py` 即可直接产出**同签名身份**的 exe。
+
+**注意**：`tools\FileTransfer-CodeSign.pfx` 与 `tools\pfx-password.txt` 是私钥与密码，本仓库为公开仓库，任何人拿到后都能用该身份签署程序。若在意，可将这两个文件从仓库移除并在本地单独备份，换电脑时手动拷贝。

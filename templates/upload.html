@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1220">
+<title>发送文件到电脑</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+</head>
+<body>
+<div class="wrap narrow">
+
+  <header class="top">
+    <div class="logo">⇅</div>
+    <div>
+      <h1>发送文件到电脑</h1>
+      <p class="sub" id="srv">正在连接…</p>
+    </div>
+    <div class="spacer"></div>
+    <span class="badge live"><i class="dot"></i> 局域网直连</span>
+  </header>
+
+  <div class="panel">
+    <div class="drop" id="drop">
+      <div class="ic">📁</div>
+      <div class="t1">点击选择文件 / 照片</div>
+      <div class="t2">也可以把文件拖到这里，支持多选、批量上传</div>
+    </div>
+    <input type="file" id="picker" multiple hidden>
+    <div id="list"></div>
+  </div>
+
+  <div class="panel" id="donePanel" hidden>
+    <h2>✅ 上传完成，可直接下载</h2>
+    <div id="links"></div>
+  </div>
+
+  <p class="foot">文件已保存到电脑本地目录，不经过任何云端 · <a class="link" href="/admin">查看全部文件</a></p>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const CHUNK = 4 * 1024 * 1024;
+const drop = document.getElementById('drop');
+const picker = document.getElementById('picker');
+const listEl = document.getElementById('list');
+const linksEl = document.getElementById('links');
+const donePanel = document.getElementById('donePanel');
+let doneCount = 0;
+
+const ICONS = {img: '🖼️', pdf: '📕', zip: '🗜️', vid: '🎬', aud: '🎵', doc: '📄', sheet: '📊', slide: '📽️', code: '💻', apk: '📦'};
+function iconOf(name) {
+  const ext = (name.split('.').pop() || '').toLowerCase();
+  if (['png','jpg','jpeg','gif','webp','heic','bmp','svg'].includes(ext)) return ICONS.img;
+  if (ext === 'pdf') return ICONS.pdf;
+  if (['zip','rar','7z','tar','gz'].includes(ext)) return ICONS.zip;
+  if (['mp4','mov','avi','mkv','webm','flv'].includes(ext)) return ICONS.vid;
+  if (['mp3','wav','aac','m4a','flac','ogg'].includes(ext)) return ICONS.aud;
+  if (['xls','xlsx','csv'].includes(ext)) return ICONS.sheet;
+  if (['ppt','pptx','key'].includes(ext)) return ICONS.slide;
+  if (['doc','docx','txt','md','rtf'].includes(ext)) return ICONS.doc;
+  if (['apk','exe','dmg','iso'].includes(ext)) return ICONS.apk;
+  if (['py','js','ts','java','go','c','cpp','html','css','json','sh'].includes(ext)) return ICONS.code;
+  return ICONS.doc;
+}
+function fmt(n) {
+  const u = ['B','KB','MB','GB','TB'];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return (i ? n.toFixed(1) : n.toFixed(0)) + ' ' + u[i];
+}
+function toast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('on');
+  clearTimeout(t._t);
+  t._t = setTimeout(() => t.classList.remove('on'), 2200);
+}
+
+/* ---------- 服务信息 ---------- */
+fetch('/api/info').then(r => r.json()).then(d => {
+  document.getElementById('srv').textContent = '已连接电脑 · ' + d.stats.count + ' 个文件 · ' + fmt(d.stats.total_size);
+}).catch(() => {
+  document.getElementById('srv').textContent = '与电脑连接中断，请重新扫码';
+});
+
+/* ---------- 选择文件 ---------- */
+drop.onclick = () => picker.click();
+picker.onchange = () => { add([...picker.files]); picker.value = ''; };
+['dragenter','dragover'].forEach(e => drop.addEventListener(e, ev => { ev.preventDefault(); drop.classList.add('hot'); }));
+['dragleave','drop'].forEach(e => drop.addEventListener(e, ev => { ev.preventDefault(); drop.classList.remove('hot'); }));
+drop.addEventListener('drop', ev => add([...ev.dataTransfer.files].filter(f => f.size > 0)));
+function add(files) {
+  files.sort((a, b) => a.size - b.size);
+  files.forEach(upload);
+}
+
+/* ---------- 分片上传 ---------- */
+function row(file) {
+  const el = document.createElement('div');
+  el.className = 'item';
+  el.innerHTML = `
+    <div class="ic">${iconOf(file.name)}</div>
+    <div class="meta">
+      <div class="nm" title="${escapeHtml(file.name)}">${escapeHtml(file.name)}</div>
+      <div class="sz">${fmt(file.size)}</div>
+      <div class="bar"><i></i></div>
+    </div>
+    <div class="state">等待中</div>`;
+  listEl.appendChild(el);
+  return { el, bar: el.querySelector('.bar > i'), st: el.querySelector('.state') };
+}
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function upload(file) {
+  const ui = row(file);
+  ui.st.textContent = '0%';
+  try {
+    let info = await postJSON('/api/upload/init', {name: file.name, size: file.size});
+    let offset = info.received || 0;
+    ui.bar.style.width = (file.size ? offset / file.size * 100 : 100) + '%';
+    while (offset < file.size) {
+      const blob = file.slice(offset, Math.min(offset + CHUNK, file.size));
+      const fd = new FormData();
+      fd.append('chunk', blob, 'chunk');
+      const res = await fetch(`/api/upload/chunk?upload_id=${info.upload_id}&offset=${offset}`, {method: 'POST', body: fd});
+      if (!res.ok) throw new Error('分片 ' + Math.floor(offset / CHUNK + 1) + ' 失败');
+      offset += blob.size;
+      const pct = file.size ? Math.min(100, offset / file.size * 100) : 100;
+      ui.bar.style.width = pct + '%';
+      ui.st.textContent = pct.toFixed(0) + '%';
+    }
+    const done = await postJSON('/api/upload/finish', {file_id: info.file_id, upload_id: info.upload_id});
+    ui.st.className = 'state ok';
+    ui.st.textContent = '完成';
+    showLink(done.file, done.link);
+  } catch (err) {
+    ui.st.className = 'state err';
+    ui.st.textContent = '失败';
+    toast(file.name + '：' + err.message);
+  }
+}
+
+function postJSON(url, body) {
+  return fetch(url, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  }).then(async r => {
+    const d = await r.json().catch(() => ({ok: false, error: 'HTTP ' + r.status}));
+    if (!d.ok) throw new Error(d.error || '上传失败');
+    return d;
+  });
+}
+
+function showLink(file, link) {
+  donePanel.hidden = false;
+  doneCount++;
+  const rowEl = document.createElement('div');
+  rowEl.className = 'item';
+  rowEl.innerHTML = `
+    <div class="ic">${iconOf(file.name)}</div>
+    <div class="meta">
+      <div class="nm">${escapeHtml(file.name)}</div>
+      <div class="sz">${fmt(file.size)} · <a class="link" href="${link}" target="_blank">${link}</a></div>
+    </div>
+    <a class="btn sm" href="${link}" download>下载</a>
+    <button class="sm" onclick="copyText('${link}')">复制</button>`;
+  linksEl.prepend(rowEl);
+}
+function copyText(text) {
+  if (navigator.clipboard) navigator.clipboard.writeText(text).then(() => toast('链接已复制'), () => toast('复制失败'));
+  else {
+    const ta = document.createElement('textarea');
+    ta.value = text; document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); toast('链接已复制'); } catch (e) { toast('复制失败'); }
+    ta.remove();
+  }
+}
+</script>
+</body>
+</html>

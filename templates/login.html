@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>访问口令 · 文件传输助手</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+</head>
+<body>
+<div class="wrap narrow">
+  <header class="top">
+    <div class="logo">⇅</div>
+    <div>
+      <h1>需要访问口令</h1>
+      <p class="sub">该服务已开启口令保护</p>
+    </div>
+  </header>
+  <div class="panel">
+    <form method="post" action="/login?next={{ next }}">
+      <input type="password" name="pin" placeholder="请输入口令" autofocus
+             style="width:100%;padding:12px;font-size:16px" required>
+      <div style="display:flex;gap:10px;margin-top:14px">
+        <button class="primary" style="flex:1;justify-content:center;padding:12px">进入</button>
+      </div>
+      {% if error %}<p style="color:#ff5c72;font-size:13px;margin:12px 0 0">{{ error }}</p>{% endif %}
+    </form>
+  </div>
+</div>
+</body>
+</html>

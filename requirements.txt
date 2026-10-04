@@ -1,4 +1,6 @@
-Flask>=3.0.0
-waitress>=3.0.0
+# 局域网文件互传工具依赖（Python 3.9+）
+fastapi>=0.110.0
+uvicorn>=0.29.0
+python-multipart>=0.0.9
 qrcode>=7.4.2
 pillow>=10.2.0

@@ -1,7 +1,4 @@
-*.pyc
 __pycache__/
-build/
-dist/
-*.spec
-received/
-data/parts/
+*.pyc
+uploads/
+lan_qrcode.png

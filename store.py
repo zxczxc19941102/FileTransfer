@@ -618,7 +618,7 @@ button.mini[data-a="del"]{color:#ffb3bd;border-color:#5a3440}
 
   <div class="card" id="pendingCard" hidden>
     <b>未完成的任务（程序异常关闭后保留，默认暂停）</b>
-    <div class="sz" style="margin:4px 0 8px">点击「继续」后重新选择<b>同一个文件</b>即可从断点接着传</div>
+    <div class="sz" style="margin:4px 0 8px">点「继续」→ 在弹出的选择框里选中<b>同一个文件</b>，即从断点接着传（浏览器不允许自动读取本地文件，所以要重选一次）</div>
     <div id="pending"></div>
   </div>
 
@@ -641,12 +641,28 @@ function fmt(n){
   while(n >= 1024 && i < u.length-1){ n /= 1024; i++; }
   return (i ? n.toFixed(2) : n) + ' ' + u[i];
 }
+function toast(msg){
+  let el = document.getElementById('toast');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'toast';
+    el.style.cssText = 'position:fixed;left:50%;bottom:26px;transform:translateX(-50%);'
+      + 'background:#262c4a;border:1px solid #363d61;color:#eef1ff;padding:9px 16px;'
+      + 'border-radius:10px;font-size:13px;z-index:99;opacity:0;transition:.25s';
+    document.body.appendChild(el);
+  }
+  el.textContent = msg;
+  el.style.opacity = '1';
+  clearTimeout(el._t);
+  el._t = setTimeout(() => { el.style.opacity = '0'; }, 2600);
+}
 function esc(s){
   return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 }
 
 /* ---------------- 上传任务管理（支持暂停 / 继续 / 删除） ---------------- */
 const TASKS = [];   // {file, upload, el, status}
+let pendingResume = null;   // 点「继续」后待绑定的未完成任务
 
 function taskRow(t){
   const el = document.createElement('div');
@@ -775,6 +791,15 @@ async function deleteTask(t){
 function addFiles(files){
   [...files].sort((a, b) => a.size - b.size).forEach(f => {
     const t = { file: f, upload: null, status: 'new' };
+    // 若刚从某个未完成任务的「继续」进来，且文件匹配，就绑定到那个任务
+    if (pendingResume) {
+      if (f.name === pendingResume.name && f.size === pendingResume.size) {
+        t.resumeUrl = '/api/upload/' + pendingResume.uid;
+      } else {
+        toast('所选文件与待续传任务不一致，将作为新任务上传');
+      }
+      pendingResume = null;
+    }
     TASKS.push(t);
     document.getElementById('up').appendChild(taskRow(t));
     startTask(t);
@@ -795,7 +820,11 @@ async function refreshPending(){
       + (p.client_ip ? '　来自 ' + esc(p.client_ip) : '') + '</div>'
       + '<div class="bar"><i style="width:' + pct + '%"></i></div>'
       + '<div class="st err">未完成 · 已暂停</div>'
-      + '<div class="ops"><button class="mini" data-u="' + p.uid + '" data-a="drop">删除</button></div>'
+      + '<div class="ops">'
+      + '<button class="mini" data-a="resume" data-u="' + p.uid + '"'
+      + ' data-n="' + esc(p.name) + '" data-s="' + p.size + '">继续</button>'
+      + '<button class="mini" data-a="drop" data-u="' + p.uid + '">删除</button>'
+      + '</div>'
       + '</div>';
   }).join('');
   box.querySelectorAll('button[data-a="drop"]').forEach(b => {
@@ -805,7 +834,16 @@ async function refreshPending(){
       refreshPending();
     };
   });
+  // 「继续」：浏览器拿不到上次选择的文件，必须让用户重新选一次，
+  // 选中的文件会绑定到这个未完成任务上续传（而不是新建）
+  box.querySelectorAll('button[data-a="resume"]').forEach(b => {
+    b.onclick = () => {
+      pendingResume = {uid: b.dataset.u, name: b.dataset.n, size: Number(b.dataset.s)};
+      pick.click();
+    };
+  });
 }
+
 
 const pick = document.getElementById('pick'), box2 = document.getElementById('box');
 pick.onchange = () => { addFiles(pick.files); pick.value = ''; };

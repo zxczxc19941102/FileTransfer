@@ -17,6 +17,7 @@
      uploads/.tus/     上传过程中的临时分片（TUS 工作目录，过期自动清理）
 """
 import asyncio
+import contextvars
 import hashlib
 import json
 import os
@@ -66,6 +67,30 @@ MEMORY_PEAK = {"value": 0.0}         # 进程内存峰值（MB），由后台任
 SERVER_IP = "127.0.0.1"             # 启动后写入真实内网 IP
 SERVER_PORT = 8000                  # 启动后写入真实端口
 
+# 当前请求的客户端 IP（由 HTTP 中间件在进入业务处理前写入）。
+# 0 字节文件、或长度极小在 POST 请求内就完成的 TUS 上传，其完成回调
+# 早于中间件登记 CLIENT_MAP，只能靠这个上下文变量拿到真实的来源地址。
+CLIENT_IP_VAR: contextvars.ContextVar = contextvars.ContextVar("client_ip", default="")
+
+# Windows 上 asyncio proactor 的既知噪音：连接已被对端关闭后再调用
+# shutdown()，会抛这些错误并打印整段堆栈，但传输结果完全正确。
+_QUIET_WINERRORS = {10022, 10054, 10053, 10038}
+
+
+def quiet_loop_exception_handler(loop, context: dict):
+    """收敛 asyncio 事件循环里的无效报错，其余异常仍按默认方式抛出。
+
+    注意要按 errno/winerror 数字判断：OSError 的 repr 在各语言环境下
+    只显示 ``OSError(10022, '…')``，字符串里并不含 "WinError"，
+    用文字匹配会漏判。
+    """
+    exc = context.get("exception")
+    if isinstance(exc, OSError):
+        code = getattr(exc, "winerror", None) or getattr(exc, "errno", None)
+        if code in _QUIET_WINERRORS:
+            return  # 连接被对端关闭/重置后的收尾回调，忽略
+    loop.default_exception_handler(context)
+
 
 def ensure_dirs():
     """创建全部工作目录（不存在则自动创建）。"""
@@ -93,6 +118,8 @@ def build_streaming_storage():
 
         async def append(self, uid: str, chunk: bytes) -> None:
             def _do() -> None:
+                if is_dropped(uid):
+                    return  # 任务已被删除：在途分片直接丢弃，不再产生孤立文件
                 self._ensure_dir()
                 with open(self._path(uid), "ab") as fp:
                     fp.write(chunk)
@@ -213,6 +240,21 @@ CLIENT_MAP: dict = {}        # 上传 ID(uid) -> 客户端 IP，由 HTTP 中间�
 ACTIVE_UPLOADS: dict = {}    # uid -> {"ts":…, "uploaded":…, "speed":…}，区分"正在上传"与"已中断"
 ACTIVE_TTL = 90              # 心跳超过该秒数未刷新，视为上传已中断（页面关闭/崩溃/断网）
 PAUSED_UIDS: dict = {}        # uid -> 操作者 IP，被要求暂停的上传（等客户端心跳确认）
+# uid -> 被删除的时刻。删除与"在途 PATCH"之间存在竞态：abort 之后客户端仍可能
+# 发出最后一两次分片请求，把刚删掉的临时文件又写回来。写盘前查这张表即可丢弃。
+DROP_UIDS: dict = {}
+DROP_TTL = 600               # 删除标记保留秒数（足够覆盖任何在途请求）
+
+
+def is_dropped(uid: str) -> bool:
+    """该任务是否处于"已删除"状态（含 TTL 内的写盘拦截窗口）。"""
+    stamp = DROP_UIDS.get(uid)
+    if not stamp:
+        return False
+    if time.time() - stamp > DROP_TTL:
+        DROP_UIDS.pop(uid, None)
+        return False
+    return True
 
 
 def _mac_of(ip: str) -> str:
@@ -364,19 +406,16 @@ LOCAL_HOSTS = local_host_addresses()
 def check_owner(uid: str, request: Request):
     """权限校验：只有任务**所有者**才能暂停 / 继续 / 删除该任务。
 
-    CLIENT_MAP 只在创建上传（POST）时写入、后续心跳不覆盖，
-    因此这里能准确判断"这个任务是谁的"。所有者未知（老任务）时放行；
-    来自本机任一地址（回环或本机局域网 IP）的请求一律视为所有者。
+    CLIENT_MAP 只在创建上传（POST）时写入、后续心跳不覆盖，因此这里能准确
+    判断"这个任务是谁的"。判定规则见 viewer_is_owner：同一台电脑的多个地址
+    互认，但**其它设备的任务仍然只读**（本机浏览器用局域网 IP 打开也一样）。
     """
     owner = task_owner(uid)
     who = (request.client.host if request.client else "") or ""
-    if not owner or who == owner:
-        return
-    if who in LOCAL_HOSTS:
-        return
-    raise HTTPException(
-        status_code=403,
-        detail=f"只能操作自己上传的任务（该任务来自 {owner}）")
+    if not viewer_is_owner(uid, who):
+        raise HTTPException(
+            status_code=403,
+            detail=f"只能操作自己上传的任务（该任务来自 {owner}）")
 
 
 def list_active_uploads() -> list:
@@ -425,15 +464,43 @@ def list_active_uploads() -> list:
     return items
 
 
-def scan_pending_uploads() -> list:
+def task_is_local(uid: str) -> bool:
+    """任务是否由**本机**（回环或本机任一网卡地址）创建。
+
+    这是**断点续传匹配**用的严格判定：别的设备（手机）传了一半的同名同
+    大小任务，绝不能被本机当成自己的断点继续写，否则两台设备的数据会
+    互相覆盖。与 check_owner 相比少了"未知所有者也放行"的宽松处理。
+    """
+    owner = CLIENT_MAP.get(uid, "")
+    return not owner or owner in LOCAL_HOSTS
+
+
+def viewer_is_owner(uid: str, viewer_ip: str) -> bool:
+    """以某个客户端视角看，该任务是否归它管。
+
+    同一台电脑可能用 127.0.0.1 或局域网 IP 访问（两个地址都是本机网卡），
+    必须互认为所有者；但**其它设备的任务仍然只读**，哪怕请求来自本机。
+    """
+    owner = CLIENT_MAP.get(uid, "")
+    if not owner or not viewer_ip:
+        return True                     # 所有者未知（老任务/服务重启）→ 放行
+    return owner == viewer_ip or (owner in LOCAL_HOSTS and viewer_ip in LOCAL_HOSTS)
+
+
+def scan_pending_uploads(include_active: bool = False, viewer_ip: str = "") -> list:
     """扫描 TUS 工作目录，返回**未完成**的上传任务列表。
 
     程序被强制关闭后，已传分片和 .info 仍留在磁盘上，这里就能把它们
     还原成"未完成任务"（默认暂停状态），供网页端与 GUI 展示。
+
+    ``include_active=True`` 时连"仍带心跳标记"的任务一起返回（多一个
+    ``active`` 字段）：客户端的断点续传检索必须用它，否则暂停/崩溃后
+    90 秒内查不到自己的断点，会新建任务从头重传。
     """
     pending = []
     if not os.path.isdir(TUS_DIR):
         return pending
+    now = time.time()
     for name in os.listdir(TUS_DIR):
         if not name.endswith(".info"):
             continue
@@ -451,16 +518,24 @@ def scan_pending_uploads() -> list:
         offset = int(info.get("offset") or 0)
         if total > 0 and offset >= total:
             continue  # 已完成但回调未跑完（异常残留），不展示
-        if is_active(uid):
+        active = is_active(uid)
+        if active and not include_active:
             continue  # 正在上传：只应出现在"上传中"区域，避免两处重复
         meta = info.get("metadata") or {}
         client_ip = CLIENT_MAP.get(uid, "")
+        device = device_info(client_ip) if client_ip else {"name": "", "mac": ""}
         pending.append({
             "uid": uid,
             "name": clean_name(meta.get("filename") or uid),
             "size": total or os.path.getsize(data_path),
             "offset": offset,
             "client_ip": client_ip,
+            "client_name": device["name"],
+            "client_mac": device["mac"],
+            "active": active,
+            "active_elapsed": int(now - ACTIVE_UPLOADS[uid]["ts"]) if active else 0,
+            "local_task": task_is_local(uid),
+            "mine": viewer_is_owner(uid, viewer_ip),
             "uploaded_at": info.get("created_at") or "",
         })
     pending.sort(key=lambda x: x["uploaded_at"], reverse=True)
@@ -612,8 +687,12 @@ async def on_upload_complete(file_path: str, info: dict):
         print(f"[接收] 计算 SHA256：{os.path.basename(final_path)}  {human_size(size)}", flush=True)
         digest = await asyncio.to_thread(sha256_of, final_path)
 
-        # 客户端信息：IP 由中间件记录，机器名 / MAC 由服务端反查（见 device_info）
-        client_ip = CLIENT_MAP.get(uid, "")
+        # 客户端信息：IP 由中间件记录，机器名 / MAC 由服务端反查（见 device_info）。
+        # 0 字节文件会在 POST 请求内就触发完成回调，此时中间件还没登记
+        # CLIENT_MAP，必须回退到请求上下文里的来源地址，否则来源信息全空。
+        client_ip = CLIENT_MAP.get(uid, "") or CLIENT_IP_VAR.get("")
+        if client_ip and not CLIENT_MAP.get(uid):
+            CLIENT_MAP[uid] = client_ip
         device = await asyncio.to_thread(device_info, client_ip) if client_ip else \
             {"ip": "", "name": "", "mac": ""}
 
@@ -678,6 +757,10 @@ def purge_once() -> int:
                     pass
         if now >= until:
             PURGE_QUEUE.pop(uid, None)
+    # 顺手回收过期的"已删除"标记，避免这张表无限增长
+    for uid, stamp in list(DROP_UIDS.items()):
+        if now - stamp > DROP_TTL:
+            DROP_UIDS.pop(uid, None)
     return removed
 
 
@@ -844,6 +927,21 @@ function esc(s){
   return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 }
 
+/* 统一的请求包装：把 HTTP 错误（尤其 403 权限不足）变成可提示的结果，
+   避免"点了删除却没反应"的静默失败。*/
+async function apiFetch(url, opts){
+  try {
+    const resp = await fetch(url, opts);
+    let data = {};
+    try { data = await resp.json(); } catch (e) { data = {}; }
+    return {ok: resp.ok, status: resp.status, data: data,
+            detail: (data && data.detail) ? data.detail : ''};
+  } catch (e) {
+    return {ok: false, status: 0, data: {},
+            detail: '网络错误：' + (e && e.message ? e.message : e)};
+  }
+}
+
 /* ---------------- 上传任务管理（支持暂停 / 继续 / 删除） ---------------- */
 /* 任务状态枚举：页面渲染与持久化一律以此为准 */
 const STATE = {
@@ -920,7 +1018,7 @@ function applyRemotePause(uid){
 /* 服务端已删除该任务：停止一切重试（不再自动重建） */
 function applyRemoteDelete(uid){
   const t = TASKS.find(x => taskUid(x) === uid);
-  if (!t) return;
+  if (!t || t.status === STATE.COMPLETED) return;   // 已完成的任务不回退成失败
   stopBeat(t);
   t.killed = true;                 // 阻止 404 后的自动重建
   t.status = STATE.ERROR;
@@ -1012,7 +1110,8 @@ async function startTask(t){
   if (!t.resumeUrl) {
     try {
       const d = await (await fetch('/api/pending')).json();
-      const hit = (d.pending || []).find(p =>
+      // mine !== false：只认自己设备发起的未完成任务，避免续写到别人的任务里
+      const hit = (d.pending || []).find(p => p.mine !== false &&
         p.name === t.file.name && p.size === t.file.size);
       if (hit) {
         t.resumeUrl = '/api/upload/' + hit.uid;
@@ -1115,7 +1214,8 @@ async function deleteTask(t){
   const gone = taskUid(t);
   if (gone) {
     forgetUid(gone);
-    try { await fetch('/api/pending/' + gone, {method: 'DELETE'}); } catch (e) {}
+    const r = await apiFetch('/api/pending/' + gone, {method: 'DELETE'});
+    if (!r.ok) toast(r.detail || '服务端分片未清除，可稍后在「未完成任务」里删除');
   }
   t.el.remove();
   const i = TASKS.indexOf(t);
@@ -1179,7 +1279,12 @@ async function refreshRemote(){
 
 /* ---------------- 未完成任务（程序异常关闭后残留） ---------------- */
 async function refreshPending(){
-  const d = await (await fetch('/api/pending')).json();
+  let d;
+  try {
+    d = await (await fetch('/api/pending')).json();
+  } catch (e) {
+    return;      // 服务端暂时不可达（重启/网络抖动）：跳过本轮，不抛未捕获异常
+  }
   const box = document.getElementById('pending');
   // 前端兜底：把本页面正在正常上传（waiting/uploading）的任务过滤掉，
   // 避免心跳延迟时同一个任务在两处重复显示
@@ -1191,32 +1296,48 @@ async function refreshPending(){
   box.innerHTML = items.map(p => {
     const pct = p.size ? Math.min(100, p.offset / p.size * 100) : 0;
     const pctTxt = pct.toFixed(2);
+    // 别人的任务只能只读展示（服务端同样会 403），按钮置灰并给出原因
+    const mine = p.mine !== false;
+    const who = [p.client_name, p.client_ip].filter(Boolean).join(' / ');
     return '<div class="row">'
       + '<div class="hd"><span class="nm">' + esc(p.name) + '</span>'
       + '<span class="pct">' + pctTxt + '%</span></div>'
       + '<div class="sz">已传 ' + fmt(p.offset) + ' / ' + fmt(p.size)
-      + (p.client_ip ? '　来自 ' + esc(p.client_ip) : '') + '</div>'
+      + (who ? '　来自 ' + esc(who) : '') + '</div>'
       + '<div class="bar"><i style="width:' + pctTxt + '%"></i></div>'
-      + '<div class="st err">未完成 · 已暂停</div>'
+      + '<div class="st err">' + (mine ? '未完成 · 已暂停' : '其它设备的任务 · 只读') + '</div>'
       + '<div class="ops">'
       + '<button class="mini" data-a="resume" data-u="' + p.uid + '"'
-      + ' data-n="' + esc(p.name) + '" data-s="' + p.size + '">继续</button>'
-      + '<button class="mini" data-a="drop" data-u="' + p.uid + '">删除</button>'
+      + ' data-n="' + esc(p.name) + '" data-s="' + p.size + '"'
+      + (mine ? '' : ' disabled') + '>继续</button>'
+      + '<button class="mini" data-a="drop" data-u="' + p.uid + '"'
+      + (mine ? '' : ' disabled') + '>删除</button>'
       + '</div>'
       + '</div>';
   }).join('');
-  box.querySelectorAll('button[data-a="drop"]').forEach(b => {
-    b.onclick = async () => {
-      if (!confirm('删除该未完成任务？已上传的分片将被清除。')) return;
-      await fetch('/api/pending/' + b.dataset.u, {method: 'DELETE'});
-      refreshPending();
-    };
-  });
-  // 「继续」：支持 File System Access API 时自动读取原文件，免弹框；
-  // 否则降级为手动选择同一个文件
-  box.querySelectorAll('button[data-a="resume"]').forEach(b => {
-    b.onclick = () => resumePendingTask(b.dataset.u, b.dataset.n, Number(b.dataset.s));
-  });
+  // 按钮一律用事件委托（只在启动时绑定一次）：列表每 3 秒重建也能稳定命中，
+  // 不会出现"恰好刷新的瞬间点击落空"
+  const pendBox = document.getElementById('pending');
+  if (!pendBox._bound) {
+    pendBox._bound = true;
+    pendBox.addEventListener('click', async (ev) => {
+      const btn = ev.target.closest('button[data-a]');
+      if (!btn) return;
+      if (btn.dataset.a === 'drop') {
+        if (!confirm('删除该未完成任务？已上传的分片将被清除。')) return;
+        const r = await apiFetch('/api/pending/' + btn.dataset.u, {method: 'DELETE'});
+        if (!r.ok) {
+          toast(r.detail || ('删除失败（HTTP ' + r.status + '）'));
+          return;
+        }
+        toast('已删除该未完成任务');
+        refreshPending();
+      } else if (btn.dataset.a === 'resume') {
+        if (btn.disabled) { toast('只能续传自己设备发起的任务'); return; }
+        resumePendingTask(btn.dataset.u, btn.dataset.n, Number(btn.dataset.s));
+      }
+    });
+  }
 }
 
 
@@ -1330,40 +1451,53 @@ async function resumePendingTask(uid, name, size) {
 }
 
 /* 刷新文件列表 */
+let lastFileSig = '';
+function fileSig(files){
+  return files.map(f => f.id + '|' + f.name + '|' + f.size).join(',');
+}
 async function refresh(){
   let d;
   try {
     d = await (await fetch('/api/files')).json();
   } catch (e) { return; }
-  document.getElementById('rows').innerHTML = d.files.map(f =>
-    '<tr class="file-row" data-id="' + esc(f.id) + '">'
-    + '<td>' + esc(f.name) + '</td>'
-    + '<td>' + fmt(f.size) + '</td>'
-    + '<td>' + f.uploaded_at + '</td>'
-    + '<td>' + esc(f.client_ip || '-') + '</td>'
-    + '<td>' + esc(f.client_name || '-') + '</td>'
-    + '<td><span class="tag">' + esc(f.client_mac || '-') + '</span></td>'
-    + '<td><button class="mini" data-del="' + esc(f.id) + '">删记录</button></td>'
-    + '</tr>').join('');
-  // 下载绑定改用事件委托：内联 onclick 里写 location.href=/files/xxx 会被
-  // JS 解析成正则字面量而报语法错误，导致点击无反应
-  document.querySelectorAll('#rows tr.file-row').forEach(tr => {
-    tr.onclick = () => {
-      location.href = '/files/' + encodeURIComponent(tr.dataset.id);
-    };
-  });
-  document.querySelectorAll('button[data-del]').forEach(b => {
-    b.onclick = async (ev) => {
-      ev.stopPropagation();
-      if (!confirm('仅删除该任务记录？uploads 里的实际文件会保留。')) return;
-      await fetch('/api/record/' + b.dataset.del, {method: 'DELETE'});
-      refresh();
-    };
-  });
-  document.getElementById('empty').style.display = d.files.length ? 'none' : 'block';
-  document.getElementById('empty').textContent = d.files.length ? '' : '暂无文件';
+  const files = d.files || [];
+  const sig = fileSig(files);
+  // 数据没变就不重建表格：每 3 秒重刷 innerHTML 会让行元素被替换，
+  // 用户恰好在刷新瞬间点击会点空（"点了没反应"）。
+  if (sig !== lastFileSig) {
+    lastFileSig = sig;
+    document.getElementById('rows').innerHTML = files.map(f =>
+      '<tr class="file-row" data-id="' + esc(f.id) + '">'
+      + '<td>' + esc(f.name) + '</td>'
+      + '<td>' + fmt(f.size) + '</td>'
+      + '<td>' + f.uploaded_at + '</td>'
+      + '<td>' + esc(f.client_ip || '-') + '</td>'
+      + '<td>' + esc(f.client_name || '-') + '</td>'
+      + '<td><span class="tag">' + esc(f.client_mac || '-') + '</span></td>'
+      + '<td><button class="mini" data-del="' + esc(f.id) + '">删记录</button></td>'
+      + '</tr>').join('');
+    // 下载绑定改用事件委托：内联 onclick 里写 location.href=/files/xxx 会被
+    // JS 解析成正则字面量而报语法错误，导致点击无反应
+    document.querySelectorAll('#rows tr.file-row').forEach(tr => {
+      tr.onclick = () => {
+        location.href = '/files/' + encodeURIComponent(tr.dataset.id);
+      };
+    });
+    document.querySelectorAll('button[data-del]').forEach(b => {
+      b.onclick = async (ev) => {
+        ev.stopPropagation();
+        if (!confirm('仅删除该任务记录？uploads 里的实际文件会保留。')) return;
+        const r = await apiFetch('/api/record/' + b.dataset.del, {method: 'DELETE'});
+        if (!r.ok) toast(r.detail || '删除记录失败');
+        lastFileSig = '';       // 强制下一轮重建
+        refresh();
+      };
+    });
+  }
+  document.getElementById('empty').style.display = files.length ? 'none' : 'block';
+  document.getElementById('empty').textContent = files.length ? '' : '暂无文件';
   document.getElementById('info').textContent =
-    '共 ' + d.count + ' 个文件 / ' + fmt(d.total) + '　剩余磁盘 ' + fmt(d.free)
+    '共 ' + (d.count || files.length) + ' 个文件 / ' + fmt(d.total || 0) + '　剩余磁盘 ' + fmt(d.free || 0)
     + '　地址 ' + location.origin;
 }
 refresh();
@@ -1425,20 +1559,38 @@ def create_app() -> FastAPI:
 
     @app.middleware("http")
     async def _record_client(request: Request, call_next):
-        """登记"上传 ID → 客户端 IP"。
+        """登记"上传 ID → 客户端 IP"，并拦截跨设备续写别人的上传任务。
 
-        TUS 的完成回调拿不到请求信息，所以在这里从 POST 创建上传的响应
-        Location 里取出上传 ID，配上发起方的 IP 存起来，完成时就能显示
-        是哪台设备传的。
+        三件事：
+          1) 把来源 IP 放进上下文变量 —— 0 字节文件在 POST 请求内就完成，
+             完成回调必须能拿到它（见 on_upload_complete）；
+          2) PATCH / HEAD / DELETE 落在别人的上传任务上时直接 403，
+             杜绝两台设备互相续写同一个任务导致文件内容混合；
+          3) 响应返回后按 Location 里的 uid 登记所有者（仅 POST 创建时写入，
+             后续心跳不覆盖，保证权限判定稳定）。
         """
-        response = await call_next(request)
-        if request.method == "POST" and "/api/upload" in request.url.path:
-            location = response.headers.get("location") or ""
-            if "/api/upload/" in location:
-                uid = location.rstrip("/").rsplit("/", 1)[-1]
-                if request.client:
-                    CLIENT_MAP[uid] = request.client.host
-        return response
+        who = request.client.host if request.client else ""
+        token = CLIENT_IP_VAR.set(who)
+        try:
+            match = re.fullmatch(r"/api/upload/([0-9a-fA-F]{8,64})/?",
+                                 request.url.path or "")
+            if match and request.method in ("PATCH", "HEAD", "DELETE"):
+                uid = match.group(1)
+                if not viewer_is_owner(uid, who):
+                    return JSONResponse(
+                        {"detail": "只能续传自己上传的任务"
+                                   f"（该任务来自 {CLIENT_MAP.get(uid, '')}）"},
+                        status_code=403)
+            response = await call_next(request)
+            if request.method == "POST" and "/api/upload" in request.url.path:
+                location = response.headers.get("location") or ""
+                if "/api/upload/" in location:
+                    uid = location.rstrip("/").rsplit("/", 1)[-1]
+                    if who:
+                        CLIENT_MAP[uid] = who
+            return response
+        finally:
+            CLIENT_IP_VAR.reset(token)
 
     # ---- TUS 分片上传路由 ----
     # max_size 设为 4EB，等同不设上限；auth=None 表示局域网内无需登录
@@ -1478,6 +1630,9 @@ def create_app() -> FastAPI:
     async def _startup():
         """启动后开启过期分片清理定时任务（每小时一次）。"""
         loop = asyncio.get_running_loop()
+        # 连接被对端关闭后的收尾回调会抛 WinError 10022/10054，
+        # 属于 Windows asyncio 的已知噪音，这里统一收敛，避免刷屏误导用户
+        loop.set_exception_handler(quiet_loop_exception_handler)
         loop.create_task(_gc_loop())
         loop.create_task(_memory_watch())
 
@@ -1488,8 +1643,12 @@ def create_app() -> FastAPI:
 
     @app.get("/api/files")
     async def api_files():
-        """全部已上传文件列表（所有设备上传的都在一起）。"""
-        items = read_all_meta()
+        """全部已上传文件列表（所有设备上传的都在一起）。
+
+        注意：只返回展示需要的字段，**不下发服务端绝对路径**（path 字段
+        属于服务端内部信息，泄露给局域网任意客户端没有必要）。
+        """
+        items = [{k: v for k, v in m.items() if k != "path"} for m in read_all_meta()]
         return {
             "files": items,
             "count": len(items),
@@ -1539,13 +1698,20 @@ def create_app() -> FastAPI:
         }
 
     @app.get("/api/pending")
-    async def api_pending():
+    async def api_pending(request: Request):
         """未完成的上传任务（已暂停 / 中断 / 程序异常关闭后残留的分片）。
 
-        正在正常上传的任务有心跳，不会出现在这里——它只应在"上传中"区域出现，
-        两处不会重复。用户重新选择同一文件即可断点续传。
+        正在正常上传的任务有心跳，默认不出现在这里——它只应在"上传中"区域
+        出现，两处不会重复。带 ``?include_active=1`` 时连有心跳的一起返回，
+        供客户端做断点续传检索（暂停后心跳可能还没过期，只查"未在传输"
+        会查不到自己的断点）。
+
+        每个条目附带 ``mine``（以请求方视角是否有权操作）与 ``local_task``
+        （是否由本机创建），前端据此只读展示别人的任务。
         """
-        items = await asyncio.to_thread(scan_pending_uploads)
+        include_active = request.query_params.get("include_active") in ("1", "true", "yes")
+        viewer = request.client.host if request.client else ""
+        items = await asyncio.to_thread(scan_pending_uploads, include_active, viewer)
         return {"pending": items, "count": len(items)}
 
     @app.post("/api/active/{uid}")
@@ -1567,6 +1733,14 @@ def create_app() -> FastAPI:
             payload = {}
         if not isinstance(payload, dict):
             payload = {}
+        alive = os.path.isfile(os.path.join(TUS_DIR, uid + ".info"))
+        # 已被要求暂停 / 已被删除的任务：心跳不得把它重新标记成"正在上传"。
+        # 否则暂停后的 90 秒里，任务会同时"显示上传中"且"不在未完成列表"，
+        # 用户重启程序时找不到断点，只能从头重传。
+        if uid in PAUSED_UIDS or is_dropped(uid) or not alive:
+            mark_inactive(uid)
+            return {"ok": True, "ttl": ACTIVE_TTL,
+                    "paused": uid in PAUSED_UIDS, "alive": alive}
         mark_active(uid,
                     uploaded=int(payload.get("uploaded") or 0),
                     speed=float(payload.get("speed") or 0.0))
@@ -1575,7 +1749,6 @@ def create_app() -> FastAPI:
         if request.client and not task_owner(uid):
             CLIENT_MAP[uid] = request.client.host
         # 回传控制指令：被其它设备暂停 / 任务已被删除
-        alive = os.path.isfile(os.path.join(TUS_DIR, uid + ".info"))
         return {"ok": True, "ttl": ACTIVE_TTL,
                 "paused": uid in PAUSED_UIDS, "alive": alive}
 
@@ -1629,6 +1802,9 @@ def create_app() -> FastAPI:
         if not re.fullmatch(r"[0-9a-f]{8,64}", uid or ""):
             raise HTTPException(status_code=400, detail="任务 ID 非法")
         check_owner(uid, request)
+        # 先登记"已删除"：在途 PATCH 到达时会被 Storage.append 直接丢弃，
+        # 否则刚删掉的分片文件又会被写回来，留下没有 .info 的孤立分片
+        DROP_UIDS[uid] = time.time()
         removed = False
         for suffix in ("", ".info"):
             path = os.path.join(TUS_DIR, uid + suffix)
@@ -1641,7 +1817,8 @@ def create_app() -> FastAPI:
         CLIENT_MAP.pop(uid, None)
         mark_inactive(uid)
         PAUSED_UIDS.pop(uid, None)
-        queue_purge(uid)   # 客户端 abort 有竞态，随后几秒反复复查残留分片
+        queue_purge(uid)                    # 客户端 abort 有竞态，随后几秒反复复查
+        await asyncio.to_thread(purge_once)  # 立刻清一次，不必等下一轮定时任务
         # 幂等：任务可能刚完成或已被删过，这种情况同样视为删除成功
         return {"ok": True, "removed": removed}
 

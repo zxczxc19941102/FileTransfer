@@ -63,6 +63,13 @@ class UploadTask:
         return f"filename {name_b64},filetype {type_b64}"
 
     def _request(self, method: str, path: str, body=None, headers=None, timeout=60):
+        """发一个短连接 HTTP 请求。
+
+        注意：这里**不能**加 ``Connection: close``。实测 Windows + uvicorn
+        组合下，服务端收到该头后立即关闭连接，与客户端刚发出的请求数据撞在
+        一起会触发整条连接被重置（60 次请求里 16 次 WinError 10054），
+        本机上传器会直接失败。保持默认 keep-alive 语义、由本端正常 close 即可。
+        """
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=timeout)
         try:
             conn.request(method, path, body=body, headers=headers or {})
@@ -70,26 +77,45 @@ class UploadTask:
             data = resp.read()
             return resp.status, dict(resp.getheaders()), data
         finally:
-            conn.close()
+            try:
+                conn.close()
+            except OSError:
+                pass
 
     def _find_existing(self):
-        """在服务端"未完成任务"中查找同名同大小的任务。
+        """在服务端"未完成任务"中查找**本机发起的**同名同大小任务。
 
         这是跨进程 / 跨程序重启断点续传的关键：程序被强杀后，原来的
         UploadTask 对象已不存在，新对象靠文件名 + 大小找回服务端残留的
         分片，继续传而不是从头再来。
+
+        两个必须点：
+          1) 带 ``include_active=1``：暂停后服务端的心跳标记可能尚未过期，
+             若只查"未在传输"的任务就会查不到，于是新建任务、已传字节作废，
+             还会多出一个「文件名(1)」副本；
+          2) 只匹配 ``local_task=true``（任务由本机任一地址创建）：避免把
+             别的设备上传的同名同大小任务当成自己的断点续写，造成两台设备
+             的数据互相覆盖。
         """
         try:
-            import json
             # 统一走 http.client：urllib 的连接复用在部分场景会被服务端提前
             # 关闭连接，导致随机 ConnectionResetError
-            status, _headers, raw = self._request("GET", "/api/pending", timeout=15)
+            status, _headers, raw = self._request(
+                "GET", "/api/pending?include_active=1", timeout=15)
             if status != 200:
                 return None
             data = json.loads(raw.decode("utf-8"))
+            best = None
             for item in data.get("pending", []):
-                if item.get("name") == self.name and int(item.get("size") or 0) == self.size:
-                    return item
+                if item.get("name") != self.name:
+                    continue
+                if int(item.get("size") or 0) != self.size:
+                    continue
+                if item.get("local_task") is not True:
+                    continue          # 别的设备的任务：绝不续写
+                if best is None or int(item.get("offset") or 0) > int(best.get("offset") or 0):
+                    best = item        # 同机多个残留时取进度最靠前的
+            return best
         except Exception:
             pass
         return None
@@ -122,16 +148,27 @@ class UploadTask:
 
     # -------- 心跳：让其它设备（网页 / 窗口）看到本机上传进度 --------
     def _beat(self, uploaded: int, speed: float):
+        """上报心跳，并**读取服务端回执**。
+
+        回执里带着控制指令：``paused``（窗口/其它设备点了暂停）、
+        ``alive``（任务是否还存在）。忽略回执会导致窗口右键"暂停上传"
+        对本机上传器完全无效——后台照旧全速传输。
+        """
         uid = self._uid()
         if not uid:
-            return
+            return None
         try:
             body = json.dumps({"uploaded": int(uploaded), "speed": round(float(speed), 2)})
-            self._request("POST", f"/api/active/{uid}", body=body.encode("utf-8"),
-                          headers={**self._headers({"Content-Type": "application/json"}),
-                                    "Content-Length": str(len(body))}, timeout=10)
+            status, _headers, raw = self._request(
+                "POST", f"/api/active/{uid}", body=body.encode("utf-8"),
+                headers={**self._headers({"Content-Type": "application/json"}),
+                         "Content-Length": str(len(body))}, timeout=10)
+            if status == 200 and raw:
+                data = json.loads(raw.decode("utf-8"))
+                return data if isinstance(data, dict) else None
         except Exception:
             pass
+        return None
 
     def _unbeat(self):
         uid = self._uid()
@@ -168,9 +205,16 @@ class UploadTask:
         self._thread.start()
 
     def pause(self):
-        """暂停：当前分片传完后停下，已传数据保留在服务端。"""
+        """暂停：当前分片传完后停下，已传数据保留在服务端。
+
+        同时立即取消服务端"正在上传"心跳标记：任务会**马上**回到
+        "未完成任务"列表，重启程序也能立刻按文件名+大小找回断点，
+        不必再等 90 秒心跳过期（否则这 90 秒里任务既显示为"上传中"
+        又不在未完成列表，重启后会从头重传并多出一个 (1) 副本）。
+        """
         self._pause.set()
         self.status = "paused"
+        self.speed = 0.0
         self._unbeat()
         self._notify()
 
@@ -224,7 +268,8 @@ class UploadTask:
             self._offset = self._query_offset()
             self.uploaded = self._offset
             self._notify()
-            self._beat(self._offset, 0.0)
+            if not self._pause.is_set():
+                self._beat(self._offset, 0.0)
 
             with open(self.path, "rb") as fp:
                 fp.seek(self._offset)
@@ -277,6 +322,15 @@ class UploadTask:
                                        or headers.get("upload-offset")
                                        or self._offset + len(block))
                     self.uploaded = self._offset
+                    # 关键：分片传完先看是不是"已经被要求暂停/停止"。
+                    # 暂停时绝不补发心跳——否则刚被 pause() 清掉的活跃标记
+                    # 又会被写回来，任务随后的 90 秒里既显示"上传中"、
+                    # 又不在"未完成任务"列表，重启后只能从头重传。
+                    if self._pause.is_set() or self._stop.is_set():
+                        self.speed = 0.0
+                        self._unbeat()
+                        self._notify()
+                        continue
                     # 速度：0.3 秒采样 + 平滑
                     now = time.time()
                     dt = now - last_time
@@ -284,7 +338,11 @@ class UploadTask:
                         inst = (self._offset - last_bytes) / 1048576 / dt
                         self.speed = (self.speed * 0.6 + inst * 0.4) if self.speed else inst
                         last_bytes, last_time = self._offset, now
-                        self._beat(self._offset, self.speed)   # 广播进度给其它设备
+                        # 广播进度给其它设备，并接收服务端的暂停指令
+                        reply = self._beat(self._offset, self.speed)
+                        if reply and reply.get("paused"):
+                            self.pause()
+                            continue
                     self._notify()
             self.status = "done"
             self.speed = 0.0

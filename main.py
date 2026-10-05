@@ -94,23 +94,20 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
     本机上传任务列表（持久化 + 右键：继续执行 / 下载 / 暂停 / 删除），
     关闭时若有上传任务会两次确认。
     """
-    import json
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
 
     from PIL import Image, ImageTk
 
-    from store import (human_size, list_active_uploads, local_machine_info,
+    from store import (BASE_DIR, human_size, list_active_uploads, local_machine_info,
                        meta_path, read_all_meta, scan_pending_uploads)
-    from uploader import LOCAL_TASK_FILE, UploadTask, load_local_tasks, save_local_tasks
+    from uploader import UploadTask, load_local_tasks, save_local_tasks
 
     root = tk.Tk()
     root.title("局域网文件传输工具 - 电脑端")
     root.geometry("900x780")
     root.configure(bg="#0f1220")
     machine = local_machine_info()
-    # 上传任务的浏览器端 uid（用于把本机任务与网页"继续"联动）
-    WEB_UID = {}
 
     # ---------------------------------------------------------- 顶部信息
     tk.Label(root, text="局域网文件传输工具", bg="#0f1220", fg="#eef1ff",
@@ -162,6 +159,30 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
     except Exception:
         self_mac = ""
 
+    # 界面异常提示（不再用 except: pass 静默吞掉刷新异常）
+    status_var = tk.StringVar(value="")
+    last_error_ts = [0.0]
+
+    def report_gui_error(message: str, once_seconds: float = 15.0):
+        """把界面异常显示在窗口底部并打印到控制台（限流，避免每 2 秒刷屏）。"""
+        status_var.set("⚠ " + message)
+        now = time.time()
+        if now - last_error_ts[0] >= once_seconds:
+            last_error_ts[0] = now
+            print(f"[界面错误] {message}", flush=True)
+
+    _menus: list = []
+
+    def popup_menu(menu, x: int, y: int):
+        """弹出右键菜单，并销毁上一次的菜单，避免 Tk 子控件无限累积。"""
+        for old in _menus:
+            try:
+                old.destroy()
+            except tk.TclError:
+                pass
+        _menus[:] = [menu]
+        menu.post(x, y)
+
     def local_uids() -> set:
         """本机上传器占用的任务 ID（只有这些任务允许本机暂停/删除）。"""
         out = set()
@@ -199,8 +220,8 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
                     a["name"], human_size(a["size"], ), f"上传中 {pct:.2f}%",
                     ("本机上传" if mine else "传输中…"),
                     a.get("client_ip") or "-", who, a.get("client_mac") or "-"))
-        except Exception:
-            pass
+        except Exception as exc:
+            report_gui_error(f"刷新传输中列表失败：{exc}")
         for rec in read_all_meta():
             tree.insert("", "end", iid=rec["id"], values=(
                 rec["name"], human_size(rec["size"]), "已完成", rec["uploaded_at"],
@@ -250,16 +271,38 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
         else:
             messagebox.showwarning("无法继续", str(msg))
 
+    def stop_local_task_by_uid(uid: str) -> bool:
+        """该 uid 若属于本机上传器，就真正停掉它（停线程 + 清服务端分片）。"""
+        for iid, rec in list(tasks.items()):
+            if rec["task"]._uid() != uid:
+                continue
+            rec["task"].cancel()
+            tasks.pop(iid, None)
+            if up_tree.exists(iid):
+                up_tree.delete(iid)
+            persist_tasks()
+            return True
+        return False
+
     def drop_remote(uid: str):
-        """删除传输中的任务（清除其已上传的分片）。"""
+        """删除传输中的任务（清除已上传分片）。
+
+        本机上传器发起的任务必须连本地上传线程一起停掉：只删服务端分片的话，
+        上传器遇到 404 会自动重建任务、从头再传一遍，等于没删掉。
+        """
         if not messagebox.askyesno("删除任务",
                 "删除该上传任务？\n已上传的分片数据也会被清除，且不可恢复。"):
+            return
+        if stop_local_task_by_uid(uid):
+            refresh_tree()
+            messagebox.showinfo("已删除", "该上传任务已停止，服务端分片已清除")
             return
         ok, msg = api_call("DELETE", f"/api/pending/{uid}")
         if ok:
             messagebox.showinfo("已删除", "该上传任务已删除")
         else:
             messagebox.showwarning("删除失败", str(msg))
+        refresh_tree()
 
     def on_rec_right_click(event):
         """已接收文件：右键菜单。
@@ -286,7 +329,7 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
                 menu.add_separator()
                 menu.add_command(label=f"只能操作自己的任务（该任务来自 {who}）",
                                  state="disabled")
-            menu.post(event.x_root, event.y_root)
+            popup_menu(menu, event.x_root, event.y_root)
             return
         menu.add_command(label="下载到本机",
                          command=lambda: webbrowser.open(f"http://127.0.0.1:{port}/files/{iid}"))
@@ -298,10 +341,16 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
                          command=lambda: reveal_path(rec_path(iid)))
         menu.add_separator()
         menu.add_command(label="删除任务（保留文件）", command=lambda: delete_record(iid))
-        menu.post(event.x_root, event.y_root)
+        popup_menu(menu, event.x_root, event.y_root)
 
     def save_as(file_id: str):
-        """下载并选择保存位置。"""
+        """下载并选择保存位置。
+
+        显式禁用代理：Clash 等系统代理环境下，urllib 可能继承 HTTP_PROXY
+        环境变量，把本该走 127.0.0.1 的下载请求发到代理上。
+        同时改成流式拷贝，避免 urlretrieve 的临时文件与内存开销。
+        """
+        import shutil
         import urllib.request
         src = rec_path(file_id)
         if not src or not os.path.isfile(src):
@@ -313,7 +362,10 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
         if not dest:
             return
         try:
-            urllib.request.urlretrieve(f"http://127.0.0.1:{port}/files/{file_id}", dest)
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(f"http://127.0.0.1:{port}/files/{file_id}", timeout=60) as resp, \
+                    open(dest, "wb") as out:
+                shutil.copyfileobj(resp, out, 1024 * 1024)
             messagebox.showinfo("下载完成", f"已保存到：\n{dest}")
         except Exception as exc:
             messagebox.showerror("下载失败", str(exc))
@@ -368,23 +420,22 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
         up_tree.column(col, width=width, anchor="w")
     up_tree.pack(side="left", fill="both", expand=True)
 
-    tasks = {}          # iid -> {"task": UploadTask, "path": str, "state": str}
+    tasks = {}          # iid -> {"task": UploadTask, "path": str, "state": str, ...}
+    # 任务状态：内部统一用英文枚举存储（只在显示时翻译成中文），
+    # 写盘 / 读盘 / 查表用同一套键，不会再出现"状态永远显示排队中"。
     STATE_TEXT = {"running": "上传中", "waiting": "排队中", "paused": "已暂停",
                   "done": "已完成", "failed": "失败", "canceled": "已取消",
                   "interrupted": "已中断"}
+    LEGACY_STATE = {"上传中": "running", "排队中": "waiting", "已暂停": "paused",
+                    "已完成": "done", "失败": "failed", "已取消": "canceled"}
 
-    def task_state_text(t):
-        if t.status == "running":
-            return "上传中"
-        if t.status in ("paused",):
-            return "已暂停"
-        if t.status == "failed":
-            return "失败"
-        if t.status == "done":
-            return "已完成"
-        if t.status == "canceled":
-            return "已取消"
-        return "排队中"
+    def norm_state(value, default: str = "waiting") -> str:
+        """归一化状态：兼容历史版本写下的中文状态，保证旧配置也能正确加载。"""
+        if not value:
+            return default
+        if value in STATE_TEXT:
+            return value
+        return LEGACY_STATE.get(str(value), default)
 
     def pct_text(uploaded, size):
         """双精度百分比，保留两位小数。"""
@@ -394,7 +445,8 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
 
     def row_values(rec):
         return (rec["name"], human_size(rec["size"]), rec.get("pct", "0.00%"),
-                rec.get("speed", "-"), STATE_TEXT.get(rec.get("state", "waiting"), "排队中"))
+                rec.get("speed", "-"),
+                STATE_TEXT.get(rec.get("state") or "waiting", "排队中"))
 
     def upsert_row(iid, rec):
         if up_tree.exists(iid):
@@ -402,11 +454,16 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
         else:
             up_tree.insert("", "end", iid=iid, values=row_values(rec))
 
-    def add_task(path: str, state: str = "waiting", uploaded: int = 0):
-        """新建（或恢复）一个本机上传任务。"""
+    def add_task(path: str, state: str = "waiting", uploaded: int = 0, iid: str = ""):
+        """新建（或恢复）一个本机上传任务；传入 iid 表示复用原行，不新增条目。"""
         task = UploadTask(path, port)
-        iid = task.iid
-        tasks[iid] = {"task": task, "path": path, "state": state, "uploaded": uploaded}
+        iid = iid or task.iid
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            mtime = 0.0
+        tasks[iid] = {"task": task, "path": path, "state": norm_state(state),
+                      "uploaded": uploaded, "mtime": mtime}
 
         def on_progress(up, size, speed, st):
             root.after(0, lambda: _update_row(iid, up, size, speed, st))
@@ -416,26 +473,29 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
         task.on_done = lambda t: root.after(0, refresh_tree)
         upsert_row(iid, {"name": task.name, "size": task.size,
                          "pct": pct_text(uploaded, task.size),
-                         "speed": "-", "state": state})
+                         "speed": "-", "state": norm_state(state)})
         return task
 
     def _update_row(iid, uploaded, size, speed, status):
+        """刷新一行任务：状态按英文枚举写入，显示时再翻译成中文。"""
         rec = tasks.get(iid)
         if not rec or not up_tree.exists(iid):
             return
+        status = norm_state(status, "waiting")
         rec["uploaded"] = uploaded
-        rec["state"] = task_state_text_str(status)
+        rec["state"] = status
         upsert_row(iid, {"name": rec["task"].name, "size": size,
                          "pct": pct_text(uploaded, size),
                          "speed": f"{speed:.1f} MB/s" if status == "running" else "-",
-                         "state": rec["state"]})
-
-    def task_state_text_str(status):
-        return {"running": "上传中", "paused": "已暂停", "done": "已完成",
-                "failed": "失败", "canceled": "已取消"}.get(status, "排队中")
+                         "state": status})
+        # 失败必须让用户看见（否则界面只显示"排队中"，错误被静默吞掉）
+        if status == "failed" and not rec.get("error_shown"):
+            rec["error_shown"] = True
+            messagebox.showerror("上传失败",
+                                 f"{rec['task'].name}\n\n{rec['task'].error or '未知错误'}")
 
     def persist_tasks():
-        """把本机上传任务持久化，重启程序后仍可续传。"""
+        """把本机上传任务持久化，重启程序后仍可续传（状态存英文枚举）。"""
         data = []
         for iid, rec in tasks.items():
             t = rec["task"]
@@ -443,18 +503,25 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
                 continue
             data.append({
                 "iid": iid, "path": rec["path"], "name": t.name,
-                "size": t.size, "mtime": os.path.getmtime(rec["path"]) if os.path.isfile(rec["path"]) else 0,
+                "size": t.size,
+                "mtime": os.path.getmtime(rec["path"]) if os.path.isfile(rec["path"]) else 0,
                 "uploaded": max(t.uploaded, rec.get("uploaded", 0)),
-                "state": rec["state"], "speed": 0.0,
+                "state": norm_state(rec.get("state"), "paused"), "speed": 0.0,
             })
         save_local_tasks(data)
-    # -------- 本机上传任务：右键菜单（任务 5）
+    # -------- 本机上传任务：右键菜单
     def continue_task(iid: str):
-        """按绝对路径自动读取原文件并断点续传（任务 3，程序端不弹选择框）。"""
+        """继续执行：复用同一行、同一个任务对象续传，不再新增任务行。
+
+        - 文件在、大小未变 → 直接 start()，沿用原 uid 与服务端断点；
+        - 文件被移动/删除，或大小已变 → 用户确认后替换本行任务（不新增条目）；
+        - 只有修改时间变化 → 提示后仍可继续。
+        """
         rec = tasks.get(iid)
         if not rec:
             return
-        path, size, mtime = rec["path"], rec["task"].size, rec.get("mtime", 0)
+        task = rec["task"]
+        path = rec["path"]
         if not os.path.isfile(path):
             if not messagebox.askyesno(
                     "原文件不存在",
@@ -463,17 +530,32 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
             picked = filedialog.askopenfilename(title="重新选择文件")
             if not picked:
                 return
-            path = picked
-        else:
-            # 校验大小/修改时间，避免续错文件
-            st = os.stat(path)
-            if size and st.st_size != size:
-                if not messagebox.askyesno("文件已变化",
-                        f"文件大小与记录不一致：\n记录 {human_size(size)}\n"
-                        f"当前 {human_size(st.st_size)}\n\n是否按新文件重新上传？"):
-                    return
-        task = add_task(path, state="waiting", uploaded=rec.get("uploaded", 0))
+            if task.status == "running":
+                task.pause()
+            tasks.pop(iid, None)
+            add_task(picked, state="waiting", uploaded=0, iid=iid).start()
+            return
+        st = os.stat(path)
+        if task.size and st.st_size != task.size:
+            if not messagebox.askyesno("文件已变化",
+                    f"文件大小与记录不一致：\n记录 {human_size(task.size)}\n"
+                    f"当前 {human_size(st.st_size)}\n\n是否按新文件重新上传？"):
+                return
+            if task.status == "running":
+                task.pause()
+            tasks.pop(iid, None)
+            add_task(path, state="waiting", uploaded=0, iid=iid).start()
+            return
+        if rec.get("mtime") and abs(st.st_mtime - rec["mtime"]) > 1:
+            if not messagebox.askyesno(
+                    "文件已被修改",
+                    "文件修改时间与记录不一致，可能不是同一个文件。\n\n"
+                    "仍要从断点继续上传吗？"):
+                return
+        if task.status == "running":
+            return                      # 本来就在传，避免重复启动
         task.start()
+        _update_row(iid, task.uploaded, task.size, 0, "running")
 
     def download_task(iid: str):
         """下载任务：已完成则下载成品，未完成则提示可下载已接收分片。"""
@@ -523,7 +605,7 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
         menu.add_separator()
         menu.add_command(label="暂停", command=lambda: pause_task(iid))
         menu.add_command(label="删除任务", command=lambda: delete_task(iid))
-        menu.post(event.x_root, event.y_root)
+        popup_menu(menu, event.x_root, event.y_root)
 
     up_tree.bind("<Button-3>", on_up_right_click)
     up_tree.bind("<Button-2>", on_up_right_click)
@@ -569,6 +651,23 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
                  wraplength=850, justify="left").pack(fill="x", padx=14, pady=(6, 0))
 
     # ---------------------------------------------------------- 底部按钮
+    # 界面异常提示条（刷新出错、上传失败等会在这里显示，不再静默吞掉）
+    tk.Label(root, textvariable=status_var, bg="#0f1220", fg="#ffcc66",
+             font=("微软雅黑", 9), anchor="w", justify="left",
+             wraplength=860).pack(fill="x", padx=14)
+
+    def open_upload_dir():
+        """打开接收目录。
+
+        必须用 store.BASE_DIR：打包成 exe 后 __file__ 指向 PyInstaller 的
+        临时解压目录，会打开一个不存在的位置。
+        """
+        folder = os.path.join(BASE_DIR, "uploads")
+        if os.name == "nt":
+            os.startfile(folder)
+        else:
+            subprocess.Popen(["xdg-open", folder])
+
     bar = tk.Frame(root, bg="#0f1220")
     bar.pack(pady=8)
     ttk.Button(bar, text="选择文件", command=pick_files).pack(side="left", padx=4)
@@ -577,12 +676,10 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
     ttk.Button(bar, text="取消/删除", command=cancel_selected).pack(side="left", padx=4)
     ttk.Button(bar, text="刷新列表", command=refresh_tree).pack(side="left", padx=4)
     ttk.Button(bar, text="打开网页", command=lambda: webbrowser.open(url)).pack(side="left", padx=4)
-    ttk.Button(bar, text="打开文件夹",
-               command=lambda: os.startfile(os.path.join(os.path.dirname(
-                   os.path.abspath(__file__)), "uploads")) if os.name == "nt"
-               else subprocess.Popen(["xdg-open", os.path.join(
-                   os.path.dirname(os.path.abspath(__file__)), "uploads")])).pack(side="left", padx=4)
-    ttk.Button(bar, text="退出", command=root.destroy).pack(side="left", padx=4)
+    ttk.Button(bar, text="打开文件夹", command=open_upload_dir).pack(side="left", padx=4)
+    # 「退出」必须走完整关闭流程（确认弹窗 + 暂停任务 + 持久化），
+    # 直接 root.destroy() 会跳过全部收尾动作
+    ttk.Button(bar, text="退出", command=lambda: on_close()).pack(side="left", padx=4)
 
     # ---------------------------------------------------------- 关闭确认
     def has_running_task() -> bool:

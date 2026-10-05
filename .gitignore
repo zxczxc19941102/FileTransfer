@@ -8,3 +8,5 @@ build/
 dist/
 *.spec
 *.log
+*.err
+*.bin

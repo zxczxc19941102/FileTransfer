@@ -21,7 +21,10 @@ import hashlib
 import json
 import os
 import shutil
+import socket
+import subprocess
 import sys
+import time
 import uuid
 from datetime import datetime, timedelta
 
@@ -29,6 +32,8 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from tuspyserver import create_tus_router
 from tuspyserver.router import TusRouterOptions
+
+from netutils import get_lan_ip
 
 # ==========================================================================
 # 一、路径与全局参数
@@ -189,6 +194,146 @@ def disk_free(path: str) -> int:
     return shutil.disk_usage(path).free
 
 
+# ==========================================================================
+# 二之二、局域网设备信息（IP / 计算机名 / MAC 地址）
+#
+# 说明：浏览器出于安全限制拿不到本机的 MAC 与计算机名，
+# 所以由服务端根据客户端 IP 反查：
+#   MAC  -> 查本机 ARP/邻居表（同局域网内有效，设备近期活动过才有记录）
+#   名称 -> 先试 DNS 反查，失败再用 NetBIOS（nbtstat）查询局域网主机名
+# 结果带 60 秒缓存，避免频繁调用系统命令。
+# ==========================================================================
+
+DEVICE_CACHE: dict = {}      # ip -> {"name": str, "mac": str}
+DEVICE_CACHE_TTL = 60        # 缓存秒数
+CLIENT_MAP: dict = {}        # 上传 ID(uid) -> 客户端 IP，由 HTTP 中间件登记
+
+
+def _mac_of(ip: str) -> str:
+    """从邻居表（ARP/NDP）反查 MAC 地址，查不到返回空字符串。"""
+    if os.name == "nt":
+        try:
+            out = subprocess.run(["arp", "-a", ip], capture_output=True,
+                                 text=True, timeout=3,
+                                 creationflags=0x08000000).stdout
+            # 形如：  192.168.1.100           0a-bc-1d-2e-3f-4a     dynamic
+            for line in out.splitlines():
+                if ip in line:
+                    parts = line.split()
+                    for token in parts:
+                        if len(token) == 17 and token.count("-") == 5:
+                            return token.replace("-", ":").upper()
+            return ""
+        except Exception:
+            return ""
+    try:  # 类 Unix：读 /proc/net/arp
+        with open("/proc/net/arp", "r", encoding="utf-8") as fp:
+            for line in fp.readlines()[1:]:
+                cols = line.split()
+                if len(cols) >= 4 and cols[0] == ip and cols[3] != "00:00:00:00:00:00":
+                    return cols[3].upper()
+    except OSError:
+        pass
+    return ""
+
+
+def _name_of(ip: str) -> str:
+    """反查计算机名：先 DNS，失败再 NetBIOS。"""
+    try:
+        name = socket.gethostbyaddr(ip)[0]
+        if name:
+            return name
+    except (OSError, IndexError):
+        pass
+    if os.name == "nt":
+        try:
+            out = subprocess.run(["nbtstat", "-A", ip], capture_output=True,
+                                 text=True, timeout=3,
+                                 creationflags=0x08000000).stdout
+            for line in out.splitlines():
+                if line.startswith(ip) or "<00>" in line:
+                    cols = line.split()
+                    if len(cols) >= 2 and cols[0] != ip:
+                        return cols[0].strip()
+        except Exception:
+            pass
+    return ""
+
+
+def device_info(ip: str) -> dict:
+    """返回 {"ip", "name", "mac"}；带 60 秒缓存。查询失败时对应字段为空。"""
+    if not ip or ip.startswith("127."):
+        return {"ip": ip or "", "name": "本机", "mac": _local_mac()}
+    local_ip = get_lan_ip()
+    if ip == local_ip:
+        info = local_machine_info()
+        return {"ip": ip, "name": info["name"], "mac": info["mac"]}
+    now = time.time()
+    cached = DEVICE_CACHE.get(ip)
+    if cached and now - cached["ts"] < DEVICE_CACHE_TTL:
+        return {"ip": ip, "name": cached["name"], "mac": cached["mac"]}
+    name, mac = _name_of(ip), _mac_of(ip)
+    DEVICE_CACHE[ip] = {"ts": now, "name": name, "mac": mac}
+    return {"ip": ip, "name": name, "mac": mac}
+
+
+def _local_mac() -> str:
+    """本机 MAC：ARP 表里没有自己，用网卡地址直接取。"""
+    node = uuid.getnode()
+    # 高位为 1 时 uuid.getnode() 返回的是随机地址，不是真实网卡
+    if (node >> 40) % 2:
+        return ""
+    return ":".join(f"{(node >> shift) & 0xFF:02X}" for shift in range(40, -1, -8))
+
+
+def local_machine_info() -> dict:
+    """本机信息（给 GUI 显示）。"""
+    return {
+        "name": socket.gethostname(),
+        "mac": _mac_of(get_lan_ip()) or _local_mac(),
+    }
+
+
+def scan_pending_uploads() -> list:
+    """扫描 TUS 工作目录，返回**未完成**的上传任务列表。
+
+    程序被强制关闭后，已传分片和 .info 仍留在磁盘上，这里就能把它们
+    还原成"未完成任务"（默认暂停状态），供网页端与 GUI 展示。
+    """
+    pending = []
+    if not os.path.isdir(TUS_DIR):
+        return pending
+    for name in os.listdir(TUS_DIR):
+        if not name.endswith(".info"):
+            continue
+        info_path = os.path.join(TUS_DIR, name)
+        try:
+            with open(info_path, "r", encoding="utf-8") as fp:
+                info = json.load(fp)
+        except (OSError, ValueError):
+            continue
+        uid = name[:-5]
+        data_path = os.path.join(TUS_DIR, uid)
+        if not os.path.isfile(data_path):
+            continue
+        total = int(info.get("size") or 0)
+        offset = int(info.get("offset") or 0)
+        if total > 0 and offset >= total:
+            continue  # 已完成但回调未跑完（异常残留），不展示
+        meta = info.get("metadata") or {}
+        client_ip = CLIENT_MAP.get(uid, "")
+        pending.append({
+            "uid": uid,
+            "name": clean_name(meta.get("filename") or uid),
+            "size": total or os.path.getsize(data_path),
+            "offset": offset,
+            "client_ip": client_ip,
+            "uploaded_at": info.get("created_at") or "",
+        })
+    pending.sort(key=lambda x: x["uploaded_at"], reverse=True)
+    return pending
+
+
 def sha256_of(path: str) -> str:
     """分块计算文件 SHA256（4MB 一块，内存占用恒定，100G 文件也不会占用多余内存）。"""
     digest = hashlib.sha256()
@@ -319,7 +464,8 @@ async def on_upload_complete(file_path: str, info: dict):
     """
     try:
         meta = info or {}
-        original = clean_name(meta.get("filename") or os.path.basename(file_path))
+        uid = os.path.basename(file_path)
+        original = clean_name(meta.get("filename") or uid)
         final_path = unique_path(UPLOAD_DIR, original)
 
         # 重命名（.tus 临时文件 → uploads 正式文件）与哈希计算都放到线程
@@ -327,6 +473,11 @@ async def on_upload_complete(file_path: str, info: dict):
         size = await asyncio.to_thread(os.path.getsize, final_path)
         print(f"[接收] 计算 SHA256：{os.path.basename(final_path)}  {human_size(size)}", flush=True)
         digest = await asyncio.to_thread(sha256_of, final_path)
+
+        # 客户端信息：IP 由中间件记录，机器名 / MAC 由服务端反查（见 device_info）
+        client_ip = CLIENT_MAP.get(uid, "")
+        device = await asyncio.to_thread(device_info, client_ip) if client_ip else \
+            {"ip": "", "name": "", "mac": ""}
 
         file_id = uuid.uuid4().hex[:12]
         await asyncio.to_thread(write_meta, file_id, {
@@ -336,6 +487,9 @@ async def on_upload_complete(file_path: str, info: dict):
             "size": size,
             "sha256": digest,
             "uploaded_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "client_ip": client_ip,
+            "client_name": device["name"],
+            "client_mac": device["mac"],
         })
         print(f"[完成] {os.path.basename(final_path)}  {human_size(size)}  sha256={digest[:16]}…", flush=True)
 
@@ -437,6 +591,13 @@ tr{cursor:pointer}tr:hover{background:#1e2338}
 .empty{color:#98a1c4;text-align:center;padding:22px 0;font-size:13px}
 a{color:#8fb0ff}
 .tag{display:inline-block;padding:1px 7px;border-radius:8px;background:#1e2338;font-size:11.5px;color:#98a1c4}
+.hd{display:flex;justify-content:space-between;align-items:center;gap:10px}
+.pct{font-size:12.5px;color:#8fb0ff;flex:none}
+.ops{display:flex;gap:6px;margin-top:8px}
+button.mini{background:#262c4a;border:1px solid #363d61;color:#cfd6f5;border-radius:7px;
+  padding:3px 12px;font-size:12.5px;cursor:pointer}
+button.mini:hover{background:#313a5c}
+button.mini[data-a="del"]{color:#ffb3bd;border-color:#5a3440}
 </style>
 </head>
 <body>
@@ -448,16 +609,22 @@ a{color:#8fb0ff}
     <div class="box" id="box">
       <div style="font-size:32px">&#128196;</div>
       <div style="margin-top:8px">点击选择文件（可多选，支持 100G 级大文件）</div>
-      <div class="sz">分片上传 · 支持断点续传 · 中断后重新选择同一文件即可继续</div>
+      <div class="sz">分片上传 · 支持断点续传 · 可随时暂停继续</div>
     </div>
     <input type="file" id="pick" multiple hidden>
     <div id="up"></div>
   </div>
 
+  <div class="card" id="pendingCard" hidden>
+    <b>未完成的任务（程序异常关闭后保留，默认暂停）</b>
+    <div class="sz" style="margin:4px 0 8px">点击「继续」后重新选择<b>同一个文件</b>即可从断点接着传</div>
+    <div id="pending"></div>
+  </div>
+
   <div class="card">
     <b>全部文件（点击任意一行下载）</b>
     <table>
-      <thead><tr><th>文件名</th><th>大小</th><th>接收时间</th><th>SHA256</th></tr></thead>
+      <thead><tr><th>文件名</th><th>大小</th><th>接收时间</th><th>来源IP</th><th>计算机名</th><th>MAC地址</th></tr></thead>
       <tbody id="rows"></tbody>
     </table>
     <div class="empty" id="empty">暂无文件</div>
@@ -466,10 +633,6 @@ a{color:#8fb0ff}
 
 <script>
 /*__TUS_JS__*/
-
-const pick = document.getElementById('pick'), box = document.getElementById('box');
-pick.onchange = () => { [...pick.files].forEach(start); pick.value = ''; };
-box.onclick = () => pick.click();
 
 function fmt(n){
   const u = ['B','KB','MB','GB','TB','PB'];
@@ -481,53 +644,139 @@ function esc(s){
   return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 }
 
-/* 单文件上传：TUS 分片 + 断点续传 */
-function start(file){
+/* ---------------- 上传任务管理（支持暂停 / 继续 / 删除） ---------------- */
+const TASKS = [];   // {file, upload, el, status}
+
+function taskRow(t){
   const el = document.createElement('div');
   el.className = 'row';
-  el.innerHTML = '<div class="nm">' + esc(file.name) + '</div>'
-    + '<div class="sz">' + fmt(file.size) + '</div>'
+  el.innerHTML =
+    '<div class="hd"><span class="nm">' + esc(t.file.name) + '</span>'
+    + '<span class="pct">0%</span></div>'
+    + '<div class="sz">' + fmt(t.file.size) + '</div>'
     + '<div class="bar"><i></i></div>'
-    + '<div class="st">准备中…</div>';
-  document.getElementById('up').appendChild(el);
-  const bar = el.querySelector('.bar > i'), st = el.querySelector('.st');
+    + '<div class="st">准备中…</div>'
+    + '<div class="ops">'
+    + '<button class="mini" data-a="pause">暂停</button>'
+    + '<button class="mini" data-a="resume" hidden>继续</button>'
+    + '<button class="mini" data-a="del">删除</button>'
+    + '</div>';
+  t.el = el;
+  t.bar = el.querySelector('.bar > i');
+  t.st = el.querySelector('.st');
+  t.pct = el.querySelector('.pct');
+  el.querySelector('.ops').addEventListener('click', ev => {
+    const act = ev.target.dataset.a;
+    if (act === 'pause') pauseTask(t);
+    else if (act === 'resume') startTask(t);
+    else if (act === 'del') deleteTask(t);
+  });
+  return el;
+}
 
-  // 速度计算所需的状态：按 0.3 秒间隔采样，并做加权平滑避免数字跳动
-  let lastTick = Date.now(), lastBytes = 0, speed = 0;
+function setBtns(t, uploading){
+  t.el.querySelector('[data-a="pause"]').hidden = !uploading;
+  t.el.querySelector('[data-a="resume"]').hidden = uploading;
+}
 
-  const upload = new tus.Upload(file, {
+function startTask(t){
+  if (t.upload) { t.upload.start(); setBtns(t, true); t.st.textContent = '上传中…'; return; }
+  // 速度计算：每 0.3 秒采样一次并平滑，避免数字跳动
+  t.lastTick = Date.now(); t.lastBytes = 0; t.speed = 0;
+  t.upload = new tus.Upload(t.file, {
     endpoint: '/api/upload/',
-    chunkSize: 32 * 1024 * 1024,                 // 32MB 一片
+    chunkSize: 32 * 1024 * 1024,
     retryDelays: [0, 1000, 3000, 5000, 10000, 20000, 30000, 60000],
-    resumeFromPreviousUpload: true,              // 断点续传：先 HEAD 查已传字节
+    resumeFromPreviousUpload: true,        // 续传：先 HEAD 查已传字节
     removeFingerprintOnSuccess: true,
-    metadata: { filename: file.name, filetype: file.type || '' },
+    metadata: { filename: t.file.name, filetype: t.file.type || '' },
     onError(err){
-      st.className = 'st err';
-      st.textContent = '失败：' + (err && err.message ? err.message : '未知错误');
+      t.st.className = 'st err';
+      t.st.textContent = '失败：' + (err && err.message ? err.message : '未知错误');
+      setBtns(t, false);
     },
     onProgress(uploaded, total){
-      const now = Date.now();
-      const dt = (now - lastTick) / 1000;
-      if (dt >= 0.3) {                       // 每 0.3 秒刷新一次，避免速度数字剧烈跳动
-        const inst = (uploaded - lastBytes) / 1048576 / dt;   // MB/s
-        speed = speed ? speed * 0.6 + inst * 0.4 : inst;      // 平滑处理
-        lastBytes = uploaded;
-        lastTick = now;
+      const now = Date.now(), dt = (now - t.lastTick) / 1000;
+      if (dt >= 0.3) {
+        const inst = (uploaded - t.lastBytes) / 1048576 / dt;
+        t.speed = t.speed ? t.speed * 0.6 + inst * 0.4 : inst;
+        t.lastBytes = uploaded; t.lastTick = now;
       }
-      const pct = total ? uploaded / total * 100 : 0;
-      bar.style.width = pct.toFixed(1) + '%';
-      st.textContent = pct.toFixed(1) + '%  (' + fmt(uploaded) + ' / ' + fmt(total) + ')'
-        + '  速度 ' + speed.toFixed(1) + ' MB/s';
+      const p = total ? uploaded / total * 100 : 0;
+      t.bar.style.width = p.toFixed(1) + '%';
+      t.pct.textContent = p.toFixed(1) + '%';
+      t.st.textContent = p.toFixed(1) + '%  (' + fmt(uploaded) + ' / ' + fmt(total) + ')'
+        + '  速度 ' + t.speed.toFixed(1) + ' MB/s';
     },
     onSuccess(){
-      st.className = 'st ok';
-      st.textContent = '上传完成';
-      refresh();
+      t.st.className = 'st ok';
+      t.st.textContent = '上传完成';
+      setBtns(t, false);
+      t.el.querySelector('[data-a="resume"]').hidden = true;
+      t.el.querySelector('[data-a="del"]').textContent = '清除';
+      refresh(); refreshPending();
     }
   });
-  upload.start();
+  t.upload.start();
+  setBtns(t, true);
+  t.st.textContent = '上传中…';
 }
+
+function pauseTask(t){
+  if (t.upload) { t.upload.abort(); t.st.textContent = '已暂停（进度已保留）'; }
+  setBtns(t, false);
+}
+
+async function deleteTask(t){
+  if (!confirm('删除该上传任务？已上传的分片数据也会被清除。')) return;
+  // 若服务端已有分片，调用终止接口清理干净
+  if (t.upload && t.upload.url) {
+    try { await fetch(t.upload.url, {method: 'DELETE'}); } catch (e) {}
+  }
+  t.el.remove();
+  const i = TASKS.indexOf(t);
+  if (i >= 0) TASKS.splice(i, 1);
+  refreshPending();
+}
+
+function addFiles(files){
+  [...files].sort((a, b) => a.size - b.size).forEach(f => {
+    const t = { file: f, upload: null, status: 'new' };
+    TASKS.push(t);
+    document.getElementById('up').appendChild(taskRow(t));
+    startTask(t);
+  });
+}
+
+/* ---------------- 未完成任务（程序异常关闭后残留） ---------------- */
+async function refreshPending(){
+  const d = await (await fetch('/api/pending')).json();
+  const box = document.getElementById('pending');
+  document.getElementById('pendingCard').hidden = d.pending.length === 0;
+  box.innerHTML = d.pending.map(p => {
+    const pct = p.size ? (p.offset / p.size * 100).toFixed(1) : '0.0';
+    return '<div class="row">'
+      + '<div class="hd"><span class="nm">' + esc(p.name) + '</span>'
+      + '<span class="pct">' + pct + '%</span></div>'
+      + '<div class="sz">已传 ' + fmt(p.offset) + ' / ' + fmt(p.size)
+      + (p.client_ip ? '　来自 ' + esc(p.client_ip) : '') + '</div>'
+      + '<div class="bar"><i style="width:' + pct + '%"></i></div>'
+      + '<div class="st err">未完成 · 已暂停</div>'
+      + '<div class="ops"><button class="mini" data-u="' + p.uid + '" data-a="drop">删除</button></div>'
+      + '</div>';
+  }).join('');
+  box.querySelectorAll('button[data-a="drop"]').forEach(b => {
+    b.onclick = async () => {
+      if (!confirm('删除该未完成任务？已上传的分片将被清除。')) return;
+      await fetch('/api/pending/' + b.dataset.u, {method: 'DELETE'});
+      refreshPending();
+    };
+  });
+}
+
+const pick = document.getElementById('pick'), box2 = document.getElementById('box');
+pick.onchange = () => { addFiles(pick.files); pick.value = ''; };
+box2.onclick = () => pick.click();
 
 /* 刷新文件列表 */
 async function refresh(){
@@ -536,12 +785,23 @@ async function refresh(){
     d = await (await fetch('/api/files')).json();
   } catch (e) { return; }
   document.getElementById('rows').innerHTML = d.files.map(f =>
-    '<tr onclick="location.href=\'/files/' + f.id + '\'">'
+    '<tr onclick="location.href=/files/' + encodeURIComponent(f.id) + '">'
     + '<td>' + esc(f.name) + '</td>'
     + '<td>' + fmt(f.size) + '</td>'
     + '<td>' + f.uploaded_at + '</td>'
-    + '<td><span class="tag" title="' + f.sha256 + '">' + f.sha256.slice(0,12) + '…</span></td>'
+    + '<td>' + esc(f.client_ip || '-') + '</td>'
+    + '<td>' + esc(f.client_name || '-') + '</td>'
+    + '<td><span class="tag">' + esc(f.client_mac || '-') + '</span></td>'
+    + '<td><button class="mini" data-del="' + f.id + '">删记录</button></td>'
     + '</tr>').join('');
+  document.querySelectorAll('button[data-del]').forEach(b => {
+    b.onclick = async (ev) => {
+      ev.stopPropagation();
+      if (!confirm('仅删除该任务记录？uploads 里的实际文件会保留。')) return;
+      await fetch('/api/record/' + b.dataset.del, {method: 'DELETE'});
+      refresh();
+    };
+  });
   document.getElementById('empty').style.display = d.files.length ? 'none' : 'block';
   document.getElementById('empty').textContent = d.files.length ? '' : '暂无文件';
   document.getElementById('info').textContent =
@@ -549,7 +809,9 @@ async function refresh(){
     + '　地址 ' + location.origin;
 }
 refresh();
+refreshPending();
 setInterval(refresh, 3000);
+setInterval(refreshPending, 5000);
 </script>
 </body>
 </html>
@@ -587,6 +849,23 @@ def create_app() -> FastAPI:
     ensure_dirs()
 
     app = FastAPI(title="局域网文件传输工具", docs_url=None, redoc_url=None)
+
+    @app.middleware("http")
+    async def _record_client(request: Request, call_next):
+        """登记"上传 ID → 客户端 IP"。
+
+        TUS 的完成回调拿不到请求信息，所以在这里从 POST 创建上传的响应
+        Location 里取出上传 ID，配上发起方的 IP 存起来，完成时就能显示
+        是哪台设备传的。
+        """
+        response = await call_next(request)
+        if request.method == "POST" and "/api/upload" in request.url.path:
+            location = response.headers.get("location") or ""
+            if "/api/upload/" in location:
+                uid = location.rstrip("/").rsplit("/", 1)[-1]
+                if request.client:
+                    CLIENT_MAP[uid] = request.client.host
+        return response
 
     # ---- TUS 分片上传路由 ----
     # max_size 设为 4EB，等同不设上限；auth=None 表示局域网内无需登录
@@ -685,6 +964,58 @@ def create_app() -> FastAPI:
             "rss": await asyncio.to_thread(process_memory_mb),
             "rss_peak": MEMORY_PEAK["value"],
         }
+
+    @app.get("/api/pending")
+    async def api_pending():
+        """未完成的上传任务（程序异常关闭后残留的分片）。
+
+        网页端与 GUI 都用它展示"未完成任务"，默认处于暂停状态；
+        用户重新选择同一文件即可断点续传。
+        """
+        items = await asyncio.to_thread(scan_pending_uploads)
+        return {"pending": items, "count": len(items)}
+
+    @app.delete("/api/pending/{uid}")
+    async def api_drop_pending(uid: str):
+        """删除某个未完成任务的临时分片（终止上传，不动已完成的文件）。"""
+        if not re.fullmatch(r"[0-9a-f]{8,64}", uid or ""):
+            raise HTTPException(status_code=400, detail="任务 ID 非法")
+        removed = False
+        for suffix in ("", ".info"):
+            path = os.path.join(TUS_DIR, uid + suffix)
+            if os.path.isfile(path):
+                try:
+                    os.remove(path)
+                    removed = True
+                except OSError as exc:
+                    raise HTTPException(status_code=500, detail=f"删除失败：{exc}") from exc
+        CLIENT_MAP.pop(uid, None)
+        if not removed:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        return {"ok": True}
+
+    @app.delete("/api/record/{file_id}")
+    async def api_delete_record(file_id: str):
+        """只删除任务记录（.meta），**不删除** uploads 里的实际文件。"""
+        path = meta_path(file_id)
+        if not os.path.isfile(path):
+            raise HTTPException(status_code=404, detail="记录不存在")
+        try:
+            os.remove(path)
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"删除失败：{exc}") from exc
+        return {"ok": True, "kept_file": True}
+
+    @app.get("/api/device")
+    async def api_device(request: Request):
+        """查询某台局域网设备的计算机名 / MAC（供 GUI 与页面显示）。"""
+        ip = request.query_params.get("ip") or (request.client.host if request.client else "")
+        return await asyncio.to_thread(device_info, ip)
+
+    @app.get("/api/machine")
+    async def api_machine():
+        """本机计算机名与 MAC。"""
+        return await asyncio.to_thread(local_machine_info)
 
     @app.exception_handler(Exception)
     async def on_unhandled(request: Request, exc: Exception):

@@ -10,10 +10,16 @@
 """
 import base64
 import http.client
+import json
+import uuid
 import os
 import threading
 import time
 import urllib.parse
+
+# 本机上传任务的持久化文件（程序重启后可继续）
+LOCAL_TASK_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "uploads", ".local_tasks.json")
 
 
 class UploadTask:
@@ -29,6 +35,8 @@ class UploadTask:
         self.uploaded = 0              # 已传字节（续传时从服务端 offset 起算）
         self.speed = 0.0               # MB/s
         self.error = ""
+        self.iid = uuid.uuid4().hex[:8]  # 界面用的任务编号
+        self.mtime = os.path.getmtime(path) if os.path.isfile(path) else 0
         self.upload_url = ""           # TUS 资源地址
         self._offset = 0
         self._path = ""
@@ -257,3 +265,45 @@ class UploadTask:
             self.error = str(exc)
             self.speed = 0.0
             self._notify()
+
+# ==========================================================================
+# 本机上传任务的持久化（任务重启后仍能在界面看到并继续）
+# ==========================================================================
+
+
+def load_local_tasks() -> list:
+    """读取上次退出时的上传任务列表。"""
+    try:
+        with open(LOCAL_TASK_FILE, "r", encoding="utf-8") as fp:
+            data = json.load(fp)
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def save_local_tasks(items: list) -> None:
+    """保存上传任务列表（原子写，避免中断损坏文件）。"""
+    try:
+        os.makedirs(os.path.dirname(LOCAL_TASK_FILE), exist_ok=True)
+        tmp = LOCAL_TASK_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fp:
+            json.dump(items, fp, ensure_ascii=False, indent=1)
+        os.replace(tmp, LOCAL_TASK_FILE)
+    except OSError:
+        pass
+
+
+def verify_task_file(path: str, size: int = 0, mtime: float = 0.0):
+    """校验原文件是否仍是同一个（名称/大小/修改时间）。
+
+    返回 (是否可用, 说明)
+    """
+    if not os.path.isfile(path):
+        return False, "原文件不存在（可能已被移动或删除）"
+    st = os.stat(path)
+    if size and st.st_size != size:
+        return False, (f"文件大小已变化：记录 {size} 字节，"
+                       f"当前 {st.st_size} 字节")
+    if mtime and abs(st.st_mtime - mtime) > 1:
+        return False, "文件修改时间已变化，可能不是同一个文件"
+    return True, "校验通过"

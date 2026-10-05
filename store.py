@@ -208,6 +208,8 @@ def disk_free(path: str) -> int:
 DEVICE_CACHE: dict = {}      # ip -> {"name": str, "mac": str}
 DEVICE_CACHE_TTL = 60        # 缓存秒数
 CLIENT_MAP: dict = {}        # 上传 ID(uid) -> 客户端 IP，由 HTTP 中间件登记
+ACTIVE_UPLOADS: dict = {}    # uid -> 最后一次心跳时间戳，用于区分"正在上传"与"已中断"
+ACTIVE_TTL = 90              # 心跳超过该秒数未刷新，视为上传已中断（页面关闭/崩溃/断网）
 
 
 def _mac_of(ip: str) -> str:
@@ -295,6 +297,26 @@ def local_machine_info() -> dict:
     }
 
 
+def is_active(uid: str) -> bool:
+    """判断某个上传是否仍在进行（心跳在有效期内）。
+
+    浏览器在上传期间会定期上报心跳；一旦页面关闭、崩溃或断网，心跳停止，
+    该任务就会被重新归入"未完成的任务"，从而不与"上传中"列表重复显示。
+    """
+    stamp = ACTIVE_UPLOADS.get(uid)
+    return bool(stamp) and (time.time() - stamp) < ACTIVE_TTL
+
+
+def mark_active(uid: str):
+    """标记为"正在上传"（客户端心跳）。"""
+    ACTIVE_UPLOADS[uid] = time.time()
+
+
+def mark_inactive(uid: str):
+    """取消"正在上传"标记（暂停 / 完成 / 删除时调用）。"""
+    ACTIVE_UPLOADS.pop(uid, None)
+
+
 def scan_pending_uploads() -> list:
     """扫描 TUS 工作目录，返回**未完成**的上传任务列表。
 
@@ -321,6 +343,8 @@ def scan_pending_uploads() -> list:
         offset = int(info.get("offset") or 0)
         if total > 0 and offset >= total:
             continue  # 已完成但回调未跑完（异常残留），不展示
+        if is_active(uid):
+            continue  # 正在上传：只应出现在"上传中"区域，避免两处重复
         meta = info.get("metadata") or {}
         client_ip = CLIENT_MAP.get(uid, "")
         pending.append({
@@ -498,6 +522,7 @@ async def on_upload_complete(file_path: str, info: dict):
         old_info = os.path.splitext(file_path)[0] + ".info"
         if os.path.isfile(old_info):
             os.remove(old_info)
+        mark_inactive(uid)          # 任务完成，取消"正在上传"标记
     except Exception as exc:  # 任何异常都不应影响服务本身
         print(f"[警告] 完成后处理失败：{exc}", flush=True)
 
@@ -610,7 +635,7 @@ button.mini[data-a="del"]{color:#ffb3bd;border-color:#5a3440}
     <div class="box" id="box">
       <div style="font-size:32px">&#128196;</div>
       <div style="margin-top:8px">点击选择文件（可多选，支持 100G 级大文件）</div>
-      <div class="sz">分片上传 · 支持断点续传 · 可随时暂停继续</div>
+      <div class="sz" id="pickTip">分片上传 · 支持断点续传 · 可随时暂停继续</div>
     </div>
     <input type="file" id="pick" multiple hidden>
     <div id="up"></div>
@@ -618,7 +643,7 @@ button.mini[data-a="del"]{color:#ffb3bd;border-color:#5a3440}
 
   <div class="card" id="pendingCard" hidden>
     <b>未完成的任务（程序异常关闭后保留，默认暂停）</b>
-    <div class="sz" style="margin:4px 0 8px">点「继续」→ 在弹出的选择框里选中<b>同一个文件</b>，即从断点接着传（浏览器不允许自动读取本地文件，所以要重选一次）</div>
+    <div class="sz" style="margin:4px 0 8px" id="pendingTip"></div>
     <div id="pending"></div>
   </div>
 
@@ -661,18 +686,57 @@ function esc(s){
 }
 
 /* ---------------- 上传任务管理（支持暂停 / 继续 / 删除） ---------------- */
-const TASKS = [];   // {file, upload, el, status}
+/* 任务状态枚举：页面渲染与持久化一律以此为准 */
+const STATE = {
+  WAITING:   'waiting',    // 排队中
+  UPLOADING: 'uploading',  // 上传中（唯一允许出现在「上传中」区域的状态）
+  PAUSED:    'paused',     // 用户主动暂停
+  ERROR:     'error',      // 失败且重试无果
+  COMPLETED: 'completed',  // 已完成
+};
+const STATE_TEXT = {
+  waiting: '排队中', uploading: '上传中', paused: '已暂停',
+  error: '失败', completed: '已完成',
+};
+const TASKS = [];   // {file, upload, el, status, uid}
 let pendingResume = null;   // 点「继续」后待绑定的未完成任务
+
+/* 心跳：声明"该任务正在上传"，让服务端不要把它算作未完成任务。
+   页面关闭 / 崩溃 / 断网后心跳停止，任务自动回到「未完成」列表。*/
+let heartbeatTimer = null;
+function beatOnce(uid){
+  if (!uid) return;
+  fetch('/api/active/' + uid, {method: 'POST'}).catch(() => {});
+}
+function stopBeat(uid){
+  if (uid) fetch('/api/active/' + uid, {method: 'DELETE'}).catch(() => {});
+  if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+}
+function startBeat(uid){
+  beatOnce(uid);
+  if (!heartbeatTimer) heartbeatTimer = setInterval(() => beatOnce(uid), 30000);
+}
+function taskUid(t){
+  if (t.upload && t.upload.url) {
+    const m = String(t.upload.url).match(/([0-9a-f]{8,64})$/);
+    if (m) return m[1];
+  }
+  if (t.resumeUrl) {
+    const m = String(t.resumeUrl).match(/([0-9a-f]{8,64})$/);
+    if (m) return m[1];
+  }
+  return '';
+}
 
 function taskRow(t){
   const el = document.createElement('div');
   el.className = 'row';
   el.innerHTML =
     '<div class="hd"><span class="nm">' + esc(t.file.name) + '</span>'
-    + '<span class="pct">0%</span></div>'
+    + '<span class="pct">0.00%</span></div>'
     + '<div class="sz">' + fmt(t.file.size) + '</div>'
     + '<div class="bar"><i></i></div>'
-    + '<div class="st">准备中…</div>'
+    + '<div class="st">排队中…</div>'
     + '<div class="ops">'
     + '<button class="mini" data-a="pause">暂停</button>'
     + '<button class="mini" data-a="resume" hidden>继续</button>'
@@ -691,15 +755,28 @@ function taskRow(t){
   return el;
 }
 
-function setBtns(t, uploading){
-  t.el.querySelector('[data-a="pause"]').hidden = !uploading;
-  t.el.querySelector('[data-a="resume"]').hidden = uploading;
+/* 依据状态统一渲染：只有 uploading/waiting 允许显示暂停按钮 */
+function renderTask(t){
+  const running = t.status === STATE.UPLOADING || t.status === STATE.WAITING;
+  t.el.querySelector('[data-a="pause"]').hidden = !running;
+  t.el.querySelector('[data-a="resume"]').hidden = running;
+  const st = t.el.querySelector('.st');
+  st.className = 'st' + (t.status === STATE.ERROR ? ' err' : (t.status === STATE.COMPLETED ? ' ok' : ''));
 }
 
 async function startTask(t){
-  if (t.upload) { t.upload.start(); setBtns(t, true); t.st.textContent = '上传中…'; return; }
+  if (t.upload) {
+    t.status = STATE.UPLOADING;
+    t.upload.start();
+    renderTask(t);
+    startBeat(taskUid(t));
+    refreshPending();      // 立即刷新：恢复上传后该任务不应再出现在"未完成"
+    return;
+  }
+  t.status = STATE.WAITING;
+  renderTask(t);
   // 速度计算：每 0.3 秒采样一次并平滑，避免数字跳动
-  t.lastTick = Date.now(); t.lastBytes = 0; t.speed = 0;
+  t.lastTick = Date.now(); t.lastBytes = 0; t.speed = 0; t.uploaded = t.uploaded || 0;
   // 先向服务端查有没有同名同大小的未完成任务：
   // tus-js-client 自带的指纹存在浏览器里，清缓存/换浏览器就会失效，
   // 这里按"文件名 + 大小"兜底，保证任何情况下都能从断点续传。
@@ -710,6 +787,7 @@ async function startTask(t){
         p.name === t.file.name && p.size === t.file.size);
       if (hit) {
         t.resumeUrl = '/api/upload/' + hit.uid;
+        t.uploaded = hit.offset || 0;
         t.st.textContent = '检测到未完成任务，从断点续传…';
       }
     } catch (e) {}
@@ -735,49 +813,69 @@ async function startTask(t){
         t.retried = true;
         t.upload = null;
         t.resumeUrl = null;
-        t.st.textContent = '原任务已失效，重新开始上传…';
         startTask(t);
         return;
       }
-      t.st.className = 'st err';
+      t.status = STATE.ERROR;
+      stopBeat(taskUid(t));
       t.st.textContent = '失败：' + (err && err.message ? err.message : '未知错误');
-      setBtns(t, false);
+      renderTask(t);
+      refreshPending();
     },
     onProgress(uploaded, total){
       const now = Date.now(), dt = (now - t.lastTick) / 1000;
-      if (dt >= 0.3) {
+      if (dt >= 0.3) {                       // 速度按 0.3 秒采样并平滑
         const inst = (uploaded - t.lastBytes) / 1048576 / dt;
         t.speed = t.speed ? t.speed * 0.6 + inst * 0.4 : inst;
         t.lastBytes = uploaded; t.lastTick = now;
       }
-      const p = total ? uploaded / total * 100 : 0;
-      t.bar.style.width = p.toFixed(1) + '%';
-      t.pct.textContent = p.toFixed(1) + '%';
-      t.st.textContent = p.toFixed(1) + '%  (' + fmt(uploaded) + ' / ' + fmt(total) + ')'
+      t.uploaded = uploaded;
+      // 双精度计算，保留两位小数；进度条与百分比始终同步
+      const p = total ? Math.min(100, uploaded / total * 100) : 0;
+      t.bar.style.width = p.toFixed(2) + '%';
+      t.pct.textContent = p.toFixed(2) + '%';
+      t.st.textContent = p.toFixed(2) + '%  (' + fmt(uploaded) + ' / ' + fmt(total) + ')'
         + '  速度 ' + t.speed.toFixed(1) + ' MB/s';
+      if (t.status !== STATE.UPLOADING) { t.status = STATE.UPLOADING; renderTask(t); }
     },
     onSuccess(){
-      t.st.className = 'st ok';
+      t.status = STATE.COMPLETED;
+      stopBeat(taskUid(t));
+      t.bar.style.width = '100.00%';
+      t.pct.textContent = '100.00%';
       t.st.textContent = '上传完成';
-      setBtns(t, false);
-      t.el.querySelector('[data-a="resume"]').hidden = true;
+      renderTask(t);
       t.el.querySelector('[data-a="del"]').textContent = '清除';
       refresh(); refreshPending();
+      // 短暂停留显示"完成"，随后从上传区移除（文件已进入「全部文件」）
+      setTimeout(() => {
+        t.el.remove();
+        const i = TASKS.indexOf(t);
+        if (i >= 0) TASKS.splice(i, 1);
+      }, 1500);
     }
   };
   t.upload = new tus.Upload(t.file, opts);
+  t.status = STATE.UPLOADING;
+  renderTask(t);
   t.upload.start();
-  setBtns(t, true);
-  t.st.textContent = '上传中…';
+  startBeat(taskUid(t));
+  setTimeout(refreshPending, 1200);
 }
 
 function pauseTask(t){
-  if (t.upload) { t.upload.abort(); t.st.textContent = '已暂停（进度已保留）'; }
-  setBtns(t, false);
+  if (t.upload) { t.upload.abort(); }
+  t.status = STATE.PAUSED;          // 主动暂停：此时才允许进入"未完成任务"
+  stopBeat(taskUid(t));
+  const p = t.file.size ? Math.min(100, (t.uploaded || 0) / t.file.size * 100) : 0;
+  t.st.textContent = '已暂停 · ' + p.toFixed(2) + '%（进度已保留）';
+  renderTask(t);
+  refreshPending();
 }
 
 async function deleteTask(t){
   if (!confirm('删除该上传任务？已上传的分片数据也会被清除。')) return;
+  stopBeat(taskUid(t));
   // 若服务端已有分片，调用终止接口清理干净
   if (t.upload && t.upload.url) {
     try { await fetch(t.upload.url, {method: 'DELETE'}); } catch (e) {}
@@ -810,15 +908,22 @@ function addFiles(files){
 async function refreshPending(){
   const d = await (await fetch('/api/pending')).json();
   const box = document.getElementById('pending');
-  document.getElementById('pendingCard').hidden = d.pending.length === 0;
-  box.innerHTML = d.pending.map(p => {
-    const pct = p.size ? (p.offset / p.size * 100).toFixed(1) : '0.0';
+  // 前端兜底：把本页面正在正常上传（waiting/uploading）的任务过滤掉，
+  // 避免心跳延迟时同一个任务在两处重复显示
+  const live = new Set(TASKS
+    .filter(t => t.status === STATE.UPLOADING || t.status === STATE.WAITING)
+    .map(taskUid).filter(Boolean));
+  const items = (d.pending || []).filter(p => !live.has(p.uid));
+  document.getElementById('pendingCard').hidden = items.length === 0;
+  box.innerHTML = items.map(p => {
+    const pct = p.size ? Math.min(100, p.offset / p.size * 100) : 0;
+    const pctTxt = pct.toFixed(2);
     return '<div class="row">'
       + '<div class="hd"><span class="nm">' + esc(p.name) + '</span>'
-      + '<span class="pct">' + pct + '%</span></div>'
+      + '<span class="pct">' + pctTxt + '%</span></div>'
       + '<div class="sz">已传 ' + fmt(p.offset) + ' / ' + fmt(p.size)
       + (p.client_ip ? '　来自 ' + esc(p.client_ip) : '') + '</div>'
-      + '<div class="bar"><i style="width:' + pct + '%"></i></div>'
+      + '<div class="bar"><i style="width:' + pctTxt + '%"></i></div>'
       + '<div class="st err">未完成 · 已暂停</div>'
       + '<div class="ops">'
       + '<button class="mini" data-a="resume" data-u="' + p.uid + '"'
@@ -834,20 +939,122 @@ async function refreshPending(){
       refreshPending();
     };
   });
-  // 「继续」：浏览器拿不到上次选择的文件，必须让用户重新选一次，
-  // 选中的文件会绑定到这个未完成任务上续传（而不是新建）
+  // 「继续」：支持 File System Access API 时自动读取原文件，免弹框；
+  // 否则降级为手动选择同一个文件
   box.querySelectorAll('button[data-a="resume"]').forEach(b => {
-    b.onclick = () => {
-      pendingResume = {uid: b.dataset.u, name: b.dataset.n, size: Number(b.dataset.s)};
-      pick.click();
-    };
+    b.onclick = () => resumePendingTask(b.dataset.u, b.dataset.n, Number(b.dataset.s));
   });
 }
 
 
+function renderTips(){
+  const el = document.getElementById('pickTip');
+  if (el) el.textContent = FSA_OK
+    ? '分片上传 · 支持断点续传 · 选择后本机可免重选直接续传'
+    : '分片上传 · 支持断点续传 · 可随时暂停继续（多选）';
+  const pt = document.getElementById('pendingTip');
+  if (pt) pt.innerHTML = FSA_OK
+    ? '点「继续」将<b>自动读取原文件</b>并从断点接着传（浏览器授权后生效）'
+    : '点「继续」后需选中<b>同一个文件</b>以续传；手机通过局域网 IP 访问时浏览器禁止网页自动读取本地文件（安全限制）';
+}
+
 const pick = document.getElementById('pick'), box2 = document.getElementById('box');
 pick.onchange = () => { addFiles(pick.files); pick.value = ''; };
-box2.onclick = () => pick.click();
+box2.onclick = () => { FSA_OK ? pickByFSA() : pick.click(); };
+
+/* ==========================================================================
+   File System Access API：让「继续」无需重新选择文件
+   --------------------------------------------------------------------------
+   浏览器限制（重要）：
+     File System Access API 只在「安全上下文」可用，即 https:// 或 http://localhost。
+     通过局域网 IP（http://192.168.1.x:端口）访问时 isSecureContext === false，
+     浏览器会禁用该 API —— 这是浏览器的硬性限制，任何网站都无法绕过。
+     因此：
+       电脑本机用 http://127.0.0.1:端口 打开 → 可自动读取原文件续传
+       手机 / 局域网 IP 打开              → 只能降级为手动重新选择
+   ========================================================================== */
+const FSA_OK = (typeof window.showOpenFilePicker === 'function') && window.isSecureContext;
+
+function handleKey(name, size) { return name + '|' + size; }
+
+function openHandleDB() {
+  return new Promise((resolve, reject) => {
+    if (typeof indexedDB === 'undefined') { reject(new Error('无 IndexedDB')); return; }
+    const rq = indexedDB.open('lan-transfer-handles', 1);
+    rq.onupgradeneeded = () => rq.result.createObjectStore('handles');
+    rq.onsuccess = () => resolve(rq.result);
+    rq.onerror = () => reject(rq.error);
+  });
+}
+
+async function saveHandle(key, handle) {
+  try {
+    const db = await openHandleDB();
+    db.transaction('handles', 'readwrite').objectStore('handles').put(handle, key);
+  } catch (e) { /* 存储失败不影响上传 */ }
+}
+
+async function loadHandle(key) {
+  try {
+    const db = await openHandleDB();
+    return await new Promise((resolve) => {
+      const rq = db.transaction('handles', 'objectStore').objectStore('handles').get(key);
+      rq.onsuccess = () => resolve(rq.result || null);
+      rq.onerror = () => resolve(null);
+    });
+  } catch (e) { return null; }
+}
+
+/* 选择文件：支持时用 File System Access API（可记住句柄，免重选续传） */
+async function pickByFSA() {
+  try {
+    const [handle] = await window.showOpenFilePicker({ multiple: false });
+    const file = await handle.getFile();
+    await saveHandle(handleKey(file.name, file.size), handle);
+    addFiles([file]);
+  } catch (e) {
+    if (e && e.name !== 'AbortError') toast('选择文件失败：' + e.message);
+  }
+}
+
+/* 「继续」：优先用记住的文件句柄直接读原文件；不可用或校验失败才回退到选择框 */
+async function resumePendingTask(uid, name, size) {
+  if (FSA_OK) {
+    const handle = await loadHandle(handleKey(name, size));
+    if (handle) {
+      try {
+        let perm = await handle.queryPermission({ mode: 'read' });
+        if (perm !== 'granted') perm = await handle.requestPermission({ mode: 'read' });
+        if (perm === 'granted') {
+          const file = await handle.getFile();
+          if (file.name === name && file.size === size) {
+            const t = { file: file, upload: null, status: STATE.WAITING,
+                        resumeUrl: '/api/upload/' + uid };
+            TASKS.push(t);
+            document.getElementById('up').appendChild(taskRow(t));
+            toast('已自动读取原文件，从断点继续');
+            startTask(t);
+            return;
+          }
+          toast('原文件已变化（大小 ' + fmt(file.size) + '），请重新选择');
+          pendingResume = { uid: uid, name: name, size: size };
+          pick.click();
+          return;
+        }
+        toast('未获得文件访问授权，请重新选择');
+      } catch (e) { /* 落到下面降级 */ }
+    } else {
+      toast('未找到该文件的记录，请重新选择一次');
+    }
+    pendingResume = { uid: uid, name: name, size: size };
+    pick.click();
+    return;
+  }
+  // 运行环境不支持 FSA（如手机通过局域网 IP 访问）：降级为手动选择
+  pendingResume = { uid: uid, name: name, size: size };
+  toast('当前环境无法自动读取本地文件，请选中同一个文件以续传');
+  pick.click();
+}
 
 /* 刷新文件列表 */
 async function refresh(){
@@ -881,8 +1088,9 @@ async function refresh(){
 }
 refresh();
 refreshPending();
+renderTips();
 setInterval(refresh, 3000);
-setInterval(refreshPending, 5000);
+setInterval(refreshPending, 3000);
 </script>
 </body>
 </html>
@@ -1038,13 +1246,31 @@ def create_app() -> FastAPI:
 
     @app.get("/api/pending")
     async def api_pending():
-        """未完成的上传任务（程序异常关闭后残留的分片）。
+        """未完成的上传任务（已暂停 / 中断 / 程序异常关闭后残留的分片）。
 
-        网页端与 GUI 都用它展示"未完成任务"，默认处于暂停状态；
-        用户重新选择同一文件即可断点续传。
+        正在正常上传的任务有心跳，不会出现在这里——它只应在"上传中"区域出现，
+        两处不会重复。用户重新选择同一文件即可断点续传。
         """
         items = await asyncio.to_thread(scan_pending_uploads)
         return {"pending": items, "count": len(items)}
+
+    @app.post("/api/active/{uid}")
+    async def api_active(uid: str):
+        """客户端心跳：声明"这个任务正在上传"。
+
+        页面在上传期间定时调用；页面关闭 / 崩溃 / 断网后心跳停止，
+        服务端就把该任务重新归入"未完成"，从而不会与"上传中"列表重复。
+        """
+        if not re.fullmatch(r"[0-9a-f]{8,64}", uid or ""):
+            raise HTTPException(status_code=400, detail="任务 ID 非法")
+        mark_active(uid)
+        return {"ok": True, "ttl": ACTIVE_TTL}
+
+    @app.delete("/api/active/{uid}")
+    async def api_inactive(uid: str):
+        """取消"正在上传"标记（暂停 / 完成 / 删除时调用）。"""
+        mark_inactive(uid)
+        return {"ok": True}
 
     @app.delete("/api/pending/{uid}")
     async def api_drop_pending(uid: str):
@@ -1061,6 +1287,7 @@ def create_app() -> FastAPI:
                 except OSError as exc:
                     raise HTTPException(status_code=500, detail=f"删除失败：{exc}") from exc
         CLIENT_MAP.pop(uid, None)
+        mark_inactive(uid)
         if not removed:
             raise HTTPException(status_code=404, detail="任务不存在")
         return {"ok": True}

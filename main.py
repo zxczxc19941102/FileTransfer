@@ -90,24 +90,26 @@ def start_server(host: str, port: int):
 def run_gui(url: str, qr_path: str, port: int, server) -> None:
     """电脑端窗口。
 
-    包含：二维码、局域网信息、已接收文件列表（IP / 计算机名 / MAC + 右键删除记录）、
-    本机上传区（进度 / 速度 / 暂停继续 / 取消）、未完成任务提示，
+    包含：二维码、局域网信息、已接收文件列表（右键菜单：下载 / 删除任务 / 打开）、
+    本机上传任务列表（持久化 + 右键：继续执行 / 下载 / 暂停 / 删除），
     关闭时若有上传任务会两次确认。
     """
+    import json
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
 
     from PIL import Image, ImageTk
 
-    from store import (MEMORY_PEAK, human_size, local_machine_info,
-                       read_all_meta, scan_pending_uploads)
-    from uploader import UploadTask
+    from store import human_size, local_machine_info, read_all_meta, scan_pending_uploads
+    from uploader import LOCAL_TASK_FILE, UploadTask, load_local_tasks, save_local_tasks
 
     root = tk.Tk()
     root.title("局域网文件传输工具 - 电脑端")
-    root.geometry("860x760")
+    root.geometry("900x780")
     root.configure(bg="#0f1220")
     machine = local_machine_info()
+    # 上传任务的浏览器端 uid（用于把本机任务与网页"继续"联动）
+    WEB_UID = {}
 
     # ---------------------------------------------------------- 顶部信息
     tk.Label(root, text="局域网文件传输工具", bg="#0f1220", fg="#eef1ff",
@@ -120,19 +122,19 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
              bg="#0f1220", fg="#9aa3c7", font=("微软雅黑", 9)).pack(pady=(2, 4))
 
     img = Image.open(qr_path)
-    img = img.resize((170, 170), Image.LANCZOS)
+    img = img.resize((160, 160), Image.LANCZOS)
     photo = ImageTk.PhotoImage(img)
     tk.Label(root, image=photo, bg="white", bd=0).pack(pady=2)
 
     # ---------------------------------------------------------- 已接收文件
-    tk.Label(root, text="已接收文件（双击下载到本机，右键删除记录）",
+    tk.Label(root, text="已接收文件（左键选中，右键：下载 / 删除任务 / 打开）",
              bg="#0f1220", fg="#eef1ff",
              font=("微软雅黑", 10, "bold")).pack(anchor="w", padx=14, pady=(6, 2))
 
     frame = tk.Frame(root, bg="#0f1220")
     frame.pack(fill="both", expand=True, padx=14)
     cols = ("name", "size", "time", "ip", "pcname", "mac")
-    tree = ttk.Treeview(frame, columns=cols, show="headings", height=9)
+    tree = ttk.Treeview(frame, columns=cols, show="headings", height=8)
     headers = (("文件名", 190), ("大小", 80), ("接收时间", 105),
                ("IP地址", 100), ("计算机名", 110), ("MAC地址", 125))
     for col, (title, width) in zip(cols, headers):
@@ -152,29 +154,67 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
                 rec.get("client_ip") or "-", rec.get("client_name") or "-",
                 rec.get("client_mac") or "-"))
 
-    def on_double_click(_event):
-        sel = tree.selection()
-        if sel:
-            webbrowser.open(f"http://127.0.0.1:{port}/files/{sel[0]}")
+    def rec_path(file_id: str) -> str:
+        for r in read_all_meta():
+            if r["id"] == file_id:
+                return r.get("path", "")
+        return ""
 
-    def on_right_click(event):
-        """右键菜单：仅删除任务记录，保留本地文件。"""
-        sel = tree.selection()
-        if not sel:
+    def on_rec_right_click(event):
+        """已接收文件：右键菜单（取消双击下载，单击仅选中）。"""
+        iid = tree.identify_row(event.y)
+        if not iid:
             return
+        tree.selection_set(iid)
         menu = tk.Menu(root, tearless=0)
-        menu.add_command(label="删除任务记录（保留文件）",
-                         command=lambda: delete_record(sel[0]))
         menu.add_command(label="下载到本机",
-                         command=lambda: webbrowser.open(
-                             f"http://127.0.0.1:{port}/files/{sel[0]}"))
+                         command=lambda: webbrowser.open(f"http://127.0.0.1:{port}/files/{iid}"))
+        menu.add_command(label="下载并选择保存位置",
+                         command=lambda: save_as(iid))
+        menu.add_separator()
+        menu.add_command(label="打开文件", command=lambda: open_path(rec_path(iid)))
+        menu.add_command(label="打开所在文件夹",
+                         command=lambda: reveal_path(rec_path(iid)))
+        menu.add_separator()
+        menu.add_command(label="删除任务（保留文件）", command=lambda: delete_record(iid))
         menu.post(event.x_root, event.y_root)
+
+    def save_as(file_id: str):
+        """下载并选择保存位置。"""
+        import urllib.request
+        src = rec_path(file_id)
+        if not src or not os.path.isfile(src):
+            messagebox.showerror("下载失败", "文件不存在")
+            return
+        name = os.path.basename(src)
+        dest = filedialog.asksaveasfilename(initialfile=name,
+                                            defaultextension=os.path.splitext(name)[1])
+        if not dest:
+            return
+        try:
+            urllib.request.urlretrieve(f"http://127.0.0.1:{port}/files/{file_id}", dest)
+            messagebox.showinfo("下载完成", f"已保存到：\n{dest}")
+        except Exception as exc:
+            messagebox.showerror("下载失败", str(exc))
+
+    def open_path(path: str):
+        if path and os.path.isfile(path):
+            (os.startfile(path) if os.name == "nt"
+             else subprocess.Popen(["xdg-open", path]))
+
+    def reveal_path(path: str):
+        if path and os.path.isfile(path):
+            folder = os.path.dirname(path)
+            if os.name == "nt":
+                subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
+            else:
+                subprocess.Popen(["xdg-open", folder])
 
     def delete_record(file_id: str):
         rec = next((r for r in read_all_meta() if r["id"] == file_id), None)
         if not rec:
             return
-        if not messagebox.askyesno("删除任务记录",
+        if not messagebox.askyesno("删除任务",
                                    f"仅删除任务记录，不删除文件：\n{rec['name']}\n\n确定删除吗？"):
             return
         try:
@@ -185,112 +225,246 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
             return
         refresh_tree()
 
-    tree.bind("<Double-1>", on_double_click)
-    tree.bind("<Button-3>", on_right_click)
-    tree.bind("<Button-2>", on_right_click)
-    # ---------------------------------------------------------- 本机上传区
-    tk.Label(root, text="从本机上传（分片 · 断点续传 · 可暂停继续）",
+    # 单击仅选中高亮；双击不做任何动作
+    tree.bind("<Button-3>", on_rec_right_click)
+    tree.bind("<Button-2>", on_rec_right_click)
+    # ---------------------------------------------------------- 本机上传任务
+    tk.Label(root, text="从本机上传（分片 · 断点续传 · 可暂停继续；右键：继续 / 下载 / 暂停 / 删除）",
              bg="#0f1220", fg="#eef1ff",
              font=("微软雅黑", 10, "bold")).pack(anchor="w", padx=14, pady=(8, 2))
 
     up_frame = ttk.Frame(root)
     up_frame.pack(fill="x", padx=14)
     up_tree = ttk.Treeview(up_frame, columns=("name", "size", "pct", "speed", "state"),
-                            show="headings", height=4)
-    up_cols = (("name", 190), ("size", 80), ("pct", 70), ("speed", 90), ("state", 90))
-    for col, (title, width) in zip(("name", "size", "pct", "speed", "state"), up_cols):
+                            show="headings", height=5)
+    for col, (title, width) in zip(("name", "size", "pct", "speed", "state"),
+                                   (("name", 180), ("size", 85), ("pct", 75),
+                                    ("speed", 95), ("state", 95))):
         up_tree.heading(col, text=title)
         up_tree.column(col, width=width, anchor="w")
     up_tree.pack(side="left", fill="both", expand=True)
 
-    tasks = {}          # iid -> UploadTask
+    tasks = {}          # iid -> {"task": UploadTask, "path": str, "state": str}
+    STATE_TEXT = {"running": "上传中", "waiting": "排队中", "paused": "已暂停",
+                  "done": "已完成", "failed": "失败", "canceled": "已取消",
+                  "interrupted": "已中断"}
 
-    STATE_TEXT = {"running": "上传中", "paused": "已暂停", "done": "已完成",
-                  "failed": "失败", "canceled": "已取消"}
+    def task_state_text(t):
+        if t.status == "running":
+            return "上传中"
+        if t.status in ("paused",):
+            return "已暂停"
+        if t.status == "failed":
+            return "失败"
+        if t.status == "done":
+            return "已完成"
+        if t.status == "canceled":
+            return "已取消"
+        return "排队中"
 
-    def add_task(path: str):
+    def pct_text(uploaded, size):
+        """双精度百分比，保留两位小数。"""
+        if not size:
+            return "0.00%"
+        return f"{min(100.0, uploaded / size * 100):.2f}%"
+
+    def row_values(rec):
+        return (rec["name"], human_size(rec["size"]), rec.get("pct", "0.00%"),
+                rec.get("speed", "-"), STATE_TEXT.get(rec.get("state", "waiting"), "排队中"))
+
+    def upsert_row(iid, rec):
+        if up_tree.exists(iid):
+            up_tree.item(iid, values=row_values(rec))
+        else:
+            up_tree.insert("", "end", iid=iid, values=row_values(rec))
+
+    def add_task(path: str, state: str = "waiting", uploaded: int = 0):
+        """新建（或恢复）一个本机上传任务。"""
         task = UploadTask(path, port)
-        iid = str(abs(hash(path)) % 10 ** 8)
-        tasks[iid] = task
-        up_tree.insert("", "end", iid=iid, values=(
-            task.name, human_size(task.size), "0%", "-", "已暂停"))
+        iid = task.iid
+        tasks[iid] = {"task": task, "path": path, "state": state, "uploaded": uploaded}
 
-        def on_progress(uploaded, size, speed, status):
-            root.after(0, lambda: _update_row(iid, uploaded, size, speed, status))
+        def on_progress(up, size, speed, st):
+            root.after(0, lambda: _update_row(iid, up, size, speed, st))
+            root.after(0, lambda: persist_tasks())
 
         task.on_progress = on_progress
         task.on_done = lambda t: root.after(0, refresh_tree)
+        upsert_row(iid, {"name": task.name, "size": task.size,
+                         "pct": pct_text(uploaded, task.size),
+                         "speed": "-", "state": state})
+        return task
 
     def _update_row(iid, uploaded, size, speed, status):
-        if not up_tree.exists(iid):
+        rec = tasks.get(iid)
+        if not rec or not up_tree.exists(iid):
             return
-        pct = (uploaded / size * 100) if size else 0
-        speed_text = f"{speed:.1f} MB/s" if status == "running" else "-"
-        up_tree.item(iid, values=(tasks[iid].name, human_size(size),
-                                  f"{pct:.1f}%", speed_text,
-                                  STATE_TEXT.get(status, status)))
+        rec["uploaded"] = uploaded
+        rec["state"] = task_state_text_str(status)
+        upsert_row(iid, {"name": rec["task"].name, "size": size,
+                         "pct": pct_text(uploaded, size),
+                         "speed": f"{speed:.1f} MB/s" if status == "running" else "-",
+                         "state": rec["state"]})
+
+    def task_state_text_str(status):
+        return {"running": "上传中", "paused": "已暂停", "done": "已完成",
+                "failed": "失败", "canceled": "已取消"}.get(status, "排队中")
+
+    def persist_tasks():
+        """把本机上传任务持久化，重启程序后仍可续传。"""
+        data = []
+        for iid, rec in tasks.items():
+            t = rec["task"]
+            if t.status in ("done", "canceled"):
+                continue
+            data.append({
+                "iid": iid, "path": rec["path"], "name": t.name,
+                "size": t.size, "mtime": os.path.getmtime(rec["path"]) if os.path.isfile(rec["path"]) else 0,
+                "uploaded": max(t.uploaded, rec.get("uploaded", 0)),
+                "state": rec["state"], "speed": 0.0,
+            })
+        save_local_tasks(data)
+    # -------- 本机上传任务：右键菜单（任务 5）
+    def continue_task(iid: str):
+        """按绝对路径自动读取原文件并断点续传（任务 3，程序端不弹选择框）。"""
+        rec = tasks.get(iid)
+        if not rec:
+            return
+        path, size, mtime = rec["path"], rec["task"].size, rec.get("mtime", 0)
+        if not os.path.isfile(path):
+            if not messagebox.askyesno(
+                    "原文件不存在",
+                    f"找不到：\n{path}\n\n原文件可能已被移动或删除，是否重新选择？"):
+                return
+            picked = filedialog.askopenfilename(title="重新选择文件")
+            if not picked:
+                return
+            path = picked
+        else:
+            # 校验大小/修改时间，避免续错文件
+            st = os.stat(path)
+            if size and st.st_size != size:
+                if not messagebox.askyesno("文件已变化",
+                        f"文件大小与记录不一致：\n记录 {human_size(size)}\n"
+                        f"当前 {human_size(st.st_size)}\n\n是否按新文件重新上传？"):
+                    return
+        task = add_task(path, state="waiting", uploaded=rec.get("uploaded", 0))
+        task.start()
+
+    def download_task(iid: str):
+        """下载任务：已完成则下载成品，未完成则提示可下载已接收分片。"""
+        rec = tasks.get(iid)
+        if not rec:
+            return
+        name = rec["task"].name
+        # 优先在已接收文件里找同名成品
+        hit = next((r for r in read_all_meta() if r["name"] == name), None)
+        if hit:
+            webbrowser.open(f"http://127.0.0.1:{port}/files/{hit['id']}")
+            return
+        # 未完成：给出已上传分片信息
+        pcts = pct_text(rec.get("uploaded", 0), rec["task"].size)
+        if messagebox.askyesno("任务未完成",
+                f"该任务尚未完成（{pcts}）。\n\n服务端已保存 "
+                f"{human_size(rec.get('uploaded', 0))} 分片。\n是否仍要下载已接收的文件列表？"):
+            refresh_tree()
+
+    def pause_task(iid: str):
+        rec = tasks.get(iid)
+        if rec:
+            rec["task"].pause()
+            _update_row(iid, rec["task"].uploaded, rec["task"].size, 0, "paused")
+            persist_tasks()
+
+    def delete_task(iid: str):
+        rec = tasks.get(iid)
+        if not rec:
+            return
+        if not messagebox.askyesno("删除任务", f"删除上传任务：\n{rec['task'].name}\n\n仅删除任务记录，不删除原文件。"):
+            return
+        rec["task"].cancel()
+        tasks.pop(iid, None)
+        if up_tree.exists(iid):
+            up_tree.delete(iid)
+        persist_tasks()
+
+    def on_up_right_click(event):
+        iid = up_tree.identify_row(event.y)
+        if not iid:
+            return
+        up_tree.selection_set(iid)
+        menu = tk.Menu(root, tearless=0)
+        menu.add_command(label="继续执行", command=lambda: continue_task(iid))
+        menu.add_command(label="下载", command=lambda: download_task(iid))
+        menu.add_separator()
+        menu.add_command(label="暂停", command=lambda: pause_task(iid))
+        menu.add_command(label="删除任务", command=lambda: delete_task(iid))
+        menu.post(event.x_root, event.y_root)
+
+    up_tree.bind("<Button-3>", on_up_right_click)
+    up_tree.bind("<Button-2>", on_up_right_click)
+
+    # -------- 启动时恢复历史任务
+    for item in load_local_tasks():
+        path = item.get("path", "")
+        if path and os.path.isfile(path):
+            add_task(path, state=item.get("state", "paused"),
+                     uploaded=item.get("uploaded", 0))
+        elif path:
+            upsert_row(item.get("iid", path), {
+                "name": item.get("name", os.path.basename(path)),
+                "size": item.get("size", 0),
+                "pct": pct_text(item.get("uploaded", 0), item.get("size", 0)),
+                "speed": "-", "state": "已中断（文件不存在）"})
 
     def pick_files():
         for path in filedialog.askopenfilenames(title="选择要上传的文件"):
-            add_task(path)
+            add_task(path).start()
 
-    def task_action(action: str):
-        sel = up_tree.selection()
-        if not sel:
-            return
-        for iid in sel:
-            task = tasks.get(iid)
-            if not task:
-                continue
-            if action == "start":
-                task.start()
-            elif action == "pause":
-                task.pause()
-            elif action == "resume":
-                task.resume()
-            elif action == "cancel":
-                if messagebox.askyesno("取消上传", "取消并清除该任务的已上传分片？"):
-                    task.cancel()
-                    up_tree.delete(iid)
-                    tasks.pop(iid, None)
-            elif action == "restart":
-                task.restart()
-                up_tree.item(iid, values=(task.name, human_size(task.size),
-                                          "0%", "-", "已暂停"))
-    # ---------------------------------------------------------- 未完成任务
+    def start_selected():
+        for iid in up_tree.selection():
+            if iid in tasks:
+                tasks[iid]["task"].start()
+                _update_row(iid, tasks[iid]["task"].uploaded,
+                            tasks[iid]["task"].size, 0, "running")
+
+    def pause_selected():
+        for iid in up_tree.selection():
+            pause_task(iid)
+
+    def cancel_selected():
+        for iid in up_tree.selection():
+            delete_task(iid)
+    # ---------------------------------------------------------- 未完成任务提示
     pending = scan_pending_uploads()
     if pending:
-        text = "上次有未完成的上传（已暂停）：" + "、".join(
-            f"{p['name']} {p['offset']}/{human_size(p['size'])}" for p in pending[:3])
+        text = "上次有未完成的上传（网页端可继续）：" + "、".join(
+            f"{p['name']} {pct_text(p['offset'], p['size'])}" for p in pending[:3])
         tk.Label(root, text=text + ("…" if len(pending) > 3 else ""),
                  bg="#3a2f14", fg="#ffcc66", font=("微软雅黑", 9),
-                 wraplength=820, justify="left").pack(fill="x", padx=14, pady=(6, 0))
+                 wraplength=850, justify="left").pack(fill="x", padx=14, pady=(6, 0))
 
     # ---------------------------------------------------------- 底部按钮
     bar = tk.Frame(root, bg="#0f1220")
     bar.pack(pady=8)
-
     ttk.Button(bar, text="选择文件", command=pick_files).pack(side="left", padx=4)
-    ttk.Button(bar, text="开始/继续", command=lambda: task_action("start")).pack(side="left", padx=4)
-    ttk.Button(bar, text="暂停", command=lambda: task_action("pause")).pack(side="left", padx=4)
-    ttk.Button(bar, text="取消", command=lambda: task_action("cancel")).pack(side="left", padx=4)
-    ttk.Button(bar, text="重传", command=lambda: task_action("restart")).pack(side="left", padx=4)
+    ttk.Button(bar, text="开始/继续", command=start_selected).pack(side="left", padx=4)
+    ttk.Button(bar, text="暂停", command=pause_selected).pack(side="left", padx=4)
+    ttk.Button(bar, text="取消/删除", command=cancel_selected).pack(side="left", padx=4)
     ttk.Button(bar, text="刷新列表", command=refresh_tree).pack(side="left", padx=4)
     ttk.Button(bar, text="打开网页", command=lambda: webbrowser.open(url)).pack(side="left", padx=4)
     ttk.Button(bar, text="打开文件夹",
-               command=lambda: os.startfile(UPLOAD_DIR) if os.name == "nt"
-               else subprocess.Popen(["xdg-open", UPLOAD_DIR])).pack(side="left", padx=4)
+               command=lambda: os.startfile(os.path.join(os.path.dirname(
+                   os.path.abspath(__file__)), "uploads")) if os.name == "nt"
+               else subprocess.Popen(["xdg-open", os.path.join(
+                   os.path.dirname(os.path.abspath(__file__)), "uploads")])).pack(side="left", padx=4)
     ttk.Button(bar, text="退出", command=root.destroy).pack(side="left", padx=4)
-
-    status_line = tk.Label(root, text="", bg="#0f1220", fg="#7f88ad", font=("微软雅黑", 8))
-    status_line.pack(pady=(0, 6))
 
     # ---------------------------------------------------------- 关闭确认
     def has_running_task() -> bool:
-        return any(t.status == "running" for t in tasks.values())
+        return any(r["task"].status == "running" for r in tasks.values())
 
     def on_close():
-        """有上传任务时，关闭需要两次确认。"""
         if has_running_task():
             if not messagebox.askyesno(
                     "仍有上传任务进行中",
@@ -303,9 +477,10 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
                     "未完成的分片会保留在服务器上。"):
                 return
         server.should_exit = True
-        for task in tasks.values():
-            if task.status == "running":
-                task.pause()
+        persist_tasks()
+        for rec in tasks.values():
+            if rec["task"].status == "running":
+                rec["task"].pause()
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", on_close)

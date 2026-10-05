@@ -492,6 +492,9 @@ function start(file){
   document.getElementById('up').appendChild(el);
   const bar = el.querySelector('.bar > i'), st = el.querySelector('.st');
 
+  // 速度计算所需的状态：按 0.3 秒间隔采样，并做加权平滑避免数字跳动
+  let lastTick = Date.now(), lastBytes = 0, speed = 0;
+
   const upload = new tus.Upload(file, {
     endpoint: '/api/upload/',
     chunkSize: 32 * 1024 * 1024,                 // 32MB 一片
@@ -504,9 +507,18 @@ function start(file){
       st.textContent = '失败：' + (err && err.message ? err.message : '未知错误');
     },
     onProgress(uploaded, total){
+      const now = Date.now();
+      const dt = (now - lastTick) / 1000;
+      if (dt >= 0.3) {                       // 每 0.3 秒刷新一次，避免速度数字剧烈跳动
+        const inst = (uploaded - lastBytes) / 1048576 / dt;   // MB/s
+        speed = speed ? speed * 0.6 + inst * 0.4 : inst;      // 平滑处理
+        lastBytes = uploaded;
+        lastTick = now;
+      }
       const pct = total ? uploaded / total * 100 : 0;
       bar.style.width = pct.toFixed(1) + '%';
-      st.textContent = pct.toFixed(1) + '%  (' + fmt(uploaded) + ' / ' + fmt(total) + ')';
+      st.textContent = pct.toFixed(1) + '%  (' + fmt(uploaded) + ' / ' + fmt(total) + ')'
+        + '  速度 ' + speed.toFixed(1) + ' MB/s';
     },
     onSuccess(){
       st.className = 'st ok';

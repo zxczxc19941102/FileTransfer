@@ -120,6 +120,33 @@ class UploadTask:
             return 0
         return int(headers.get("Upload-Offset") or headers.get("upload-offset") or 0)
 
+    # -------- 心跳：让其它设备（网页 / 窗口）看到本机上传进度 --------
+    def _beat(self, uploaded: int, speed: float):
+        uid = self._uid()
+        if not uid:
+            return
+        try:
+            body = json.dumps({"uploaded": int(uploaded), "speed": round(float(speed), 2)})
+            self._request("POST", f"/api/active/{uid}", body=body.encode("utf-8"),
+                          headers={**self._headers({"Content-Type": "application/json"}),
+                                    "Content-Length": str(len(body))}, timeout=10)
+        except Exception:
+            pass
+
+    def _unbeat(self):
+        uid = self._uid()
+        if uid:
+            try:
+                self._request("DELETE", f"/api/active/{uid}",
+                              headers=self._headers({}), timeout=10)
+            except Exception:
+                pass
+
+    def _uid(self) -> str:
+        """当前任务的服务端 ID（从 upload_url 末尾取）。"""
+        url = self.upload_url or ""
+        return url.rstrip("/").rsplit("/", 1)[-1] if url else ""
+
     def _notify(self):
         if self.on_progress:
             try:
@@ -144,6 +171,7 @@ class UploadTask:
         """暂停：当前分片传完后停下，已传数据保留在服务端。"""
         self._pause.set()
         self.status = "paused"
+        self._unbeat()
         self._notify()
 
     def resume(self):
@@ -155,6 +183,7 @@ class UploadTask:
         """取消任务，并删除服务端已上传的分片。"""
         self._stop.set()
         self._pause.clear()
+        self._unbeat()
         self.status = "canceled"
         if self.upload_url:
             try:
@@ -195,6 +224,7 @@ class UploadTask:
             self._offset = self._query_offset()
             self.uploaded = self._offset
             self._notify()
+            self._beat(self._offset, 0.0)
 
             with open(self.path, "rb") as fp:
                 fp.seek(self._offset)
@@ -254,9 +284,11 @@ class UploadTask:
                         inst = (self._offset - last_bytes) / 1048576 / dt
                         self.speed = (self.speed * 0.6 + inst * 0.4) if self.speed else inst
                         last_bytes, last_time = self._offset, now
+                        self._beat(self._offset, self.speed)   # 广播进度给其它设备
                     self._notify()
             self.status = "done"
             self.speed = 0.0
+            self._unbeat()
             self._notify()
             if self.on_done:
                 self.on_done(self)
@@ -264,6 +296,7 @@ class UploadTask:
             self.status = "failed"
             self.error = str(exc)
             self.speed = 0.0
+            self._unbeat()
             self._notify()
 
 # ==========================================================================

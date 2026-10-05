@@ -100,7 +100,8 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
 
     from PIL import Image, ImageTk
 
-    from store import human_size, local_machine_info, read_all_meta, scan_pending_uploads
+    from store import (human_size, list_active_uploads, local_machine_info,
+                   read_all_meta, scan_pending_uploads)
     from uploader import LOCAL_TASK_FILE, UploadTask, load_local_tasks, save_local_tasks
 
     root = tk.Tk()
@@ -127,16 +128,16 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
     tk.Label(root, image=photo, bg="white", bd=0).pack(pady=2)
 
     # ---------------------------------------------------------- 已接收文件
-    tk.Label(root, text="已接收文件（左键选中，右键：下载 / 删除任务 / 打开）",
+    tk.Label(root, text="已接收文件（其他设备上传时这里会实时显示进度；左键选中，右键：下载 / 删除）",
              bg="#0f1220", fg="#eef1ff",
              font=("微软雅黑", 10, "bold")).pack(anchor="w", padx=14, pady=(6, 2))
 
     frame = tk.Frame(root, bg="#0f1220")
     frame.pack(fill="both", expand=True, padx=14)
-    cols = ("name", "size", "time", "ip", "pcname", "mac")
+    cols = ("name", "size", "state", "time", "ip", "pcname", "mac")
     tree = ttk.Treeview(frame, columns=cols, show="headings", height=8)
-    headers = (("文件名", 190), ("大小", 80), ("接收时间", 105),
-               ("IP地址", 100), ("计算机名", 110), ("MAC地址", 125))
+    headers = (("文件名", 175), ("大小", 80), ("状态", 105), ("接收时间", 100),
+               ("IP地址", 100), ("计算机名", 100), ("MAC地址", 120))
     for col, (title, width) in zip(cols, headers):
         tree.heading(col, text=title)
         tree.column(col, width=width, anchor="w")
@@ -148,9 +149,19 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
     def refresh_tree():
         for item in tree.get_children():
             tree.delete(item)
+        # 其他设备正在上传的任务：显示实时进度（其它设备/网页端上传时同步可见）
+        try:
+            for a in list_active_uploads():
+                pct = min(100.0, a["uploaded"] / a["size"] * 100) if a["size"] else 0.0
+                who = a.get("client_name") or a.get("client_ip") or "未知设备"
+                tree.insert("", "end", iid="live_" + a["uid"], values=(
+                    a["name"], human_size(a["size"]), f"上传中 {pct:.2f}%", "传输中…",
+                    a.get("client_ip") or "-", who, a.get("client_mac") or "-"))
+        except Exception:
+            pass
         for rec in read_all_meta():
             tree.insert("", "end", iid=rec["id"], values=(
-                rec["name"], human_size(rec["size"]), rec["uploaded_at"],
+                rec["name"], human_size(rec["size"]), "已完成", rec["uploaded_at"],
                 rec.get("client_ip") or "-", rec.get("client_name") or "-",
                 rec.get("client_mac") or "-"))
 

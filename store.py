@@ -303,18 +303,71 @@ def is_active(uid: str) -> bool:
     浏览器在上传期间会定期上报心跳；一旦页面关闭、崩溃或断网，心跳停止，
     该任务就会被重新归入"未完成的任务"，从而不与"上传中"列表重复显示。
     """
-    stamp = ACTIVE_UPLOADS.get(uid)
+    rec = ACTIVE_UPLOADS.get(uid)
+    if not rec:
+        return False
+    stamp = rec.get("ts") if isinstance(rec, dict) else rec
     return bool(stamp) and (time.time() - stamp) < ACTIVE_TTL
 
 
-def mark_active(uid: str):
-    """标记为"正在上传"（客户端心跳）。"""
-    ACTIVE_UPLOADS[uid] = time.time()
+def mark_active(uid: str, uploaded: int = 0, speed: float = 0.0):
+    """标记为"正在上传"，并记录客户端上报的进度与速度。"""
+    ACTIVE_UPLOADS[uid] = {
+        "ts": time.time(),
+        "uploaded": int(uploaded or 0),
+        "speed": float(speed or 0.0),
+    }
 
 
 def mark_inactive(uid: str):
     """取消"正在上传"标记（暂停 / 完成 / 删除时调用）。"""
     ACTIVE_UPLOADS.pop(uid, None)
+
+
+def list_active_uploads() -> list:
+    """列出所有正在上传的任务（含进度/速度/来源），供其他设备同步显示。
+
+    进度优先取客户端心跳上报的值；若客户端未上报（例如本机上传器
+    刚创建任务），则回退读取 .info 里的 offset，保证一开始就能显示。
+    """
+    now = time.time()
+    items = []
+    for uid, info in list(ACTIVE_UPLOADS.items()):
+        if now - info["ts"] >= ACTIVE_TTL:
+            ACTIVE_UPLOADS.pop(uid, None)   # 心跳超时，视为已中断
+            continue
+        # 兜底：任务完成/删除后 .info 会消失，此时无论心跳状态如何都不该算"正在上传"
+        if not os.path.isfile(os.path.join(TUS_DIR, uid + ".info")):
+            ACTIVE_UPLOADS.pop(uid, None)
+            continue
+        meta_path_ = os.path.join(TUS_DIR, uid + ".info")
+        name, total, offset, created = uid, 0, 0, ""
+        try:
+            with open(meta_path_, "r", encoding="utf-8") as fp:
+                raw = json.load(fp)
+            name = clean_name((raw.get("metadata") or {}).get("filename") or uid)
+            total = int(raw.get("size") or 0)
+            offset = int(raw.get("offset") or 0)
+            created = raw.get("created_at") or ""
+        except (OSError, ValueError):
+            pass
+        uploaded = max(info.get("uploaded") or 0, offset)
+        ip = CLIENT_MAP.get(uid, "")
+        device = device_info(ip) if ip else {"name": "", "mac": ""}
+        items.append({
+            "uid": uid,
+            "name": name,
+            "size": total,
+            "uploaded": min(uploaded, total) if total else uploaded,
+            "speed": round(info.get("speed") or 0.0, 2),
+            "client_ip": ip,
+            "client_name": device["name"],
+            "client_mac": device["mac"],
+            "created_at": created,
+            "elapsed": int(now - info["ts"]),
+        })
+    items.sort(key=lambda x: x["created_at"], reverse=True)
+    return items
 
 
 def scan_pending_uploads() -> list:
@@ -496,6 +549,11 @@ async def on_upload_complete(file_path: str, info: dict):
         # 重命名（.tus 临时文件 → uploads 正式文件）与哈希计算都放到线程
         await asyncio.to_thread(os.replace, file_path, final_path)
         size = await asyncio.to_thread(os.path.getsize, final_path)
+
+        # 数据已完整落盘，立刻取消"正在上传"标记：
+        # 其他设备不必等服务端算完 SHA256（大文件可能耗时数十秒）才停止显示进度
+        mark_inactive(uid)
+
         print(f"[接收] 计算 SHA256：{os.path.basename(final_path)}  {human_size(size)}", flush=True)
         digest = await asyncio.to_thread(sha256_of, final_path)
 
@@ -525,6 +583,12 @@ async def on_upload_complete(file_path: str, info: dict):
         mark_inactive(uid)          # 任务完成，取消"正在上传"标记
     except Exception as exc:  # 任何异常都不应影响服务本身
         print(f"[警告] 完成后处理失败：{exc}", flush=True)
+    finally:
+        # 无论后续处理是否出错，都不能让它一直显示为"正在上传"
+        try:
+            mark_inactive(os.path.basename(file_path))
+        except Exception:
+            pass
 
 
 # ==========================================================================
@@ -631,6 +695,12 @@ button.mini[data-a="del"]{color:#ffb3bd;border-color:#5a3440}
   <h1>局域网文件传输</h1>
   <p class="sub" id="info">正在连接…</p>
 
+  <div class="card" id="remoteCard" hidden>
+    <b>其他设备正在上传</b>
+    <div class="sz" style="margin:4px 0 8px">实时同步显示局域网内其它设备的上传进度（只读）</div>
+    <div id="remote"></div>
+  </div>
+
   <div class="card">
     <div class="box" id="box">
       <div style="font-size:32px">&#128196;</div>
@@ -704,28 +774,38 @@ let pendingResume = null;   // 点「继续」后待绑定的未完成任务
 /* 心跳：声明"该任务正在上传"，让服务端不要把它算作未完成任务。
    页面关闭 / 崩溃 / 断网后心跳停止，任务自动回到「未完成」列表。*/
 let heartbeatTimer = null;
-function beatOnce(uid){
+let heartTask = null;
+function beatOnce(uid, uploaded, speed){
   if (!uid) return;
-  fetch('/api/active/' + uid, {method: 'POST'}).catch(() => {});
+  fetch('/api/active/' + uid, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({uploaded: uploaded || 0, speed: speed || 0})
+  }).catch(() => {});
 }
-function stopBeat(uid){
-  if (uid) fetch('/api/active/' + uid, {method: 'DELETE'}).catch(() => {});
-  if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+/* 每个任务各自维护心跳（支持多任务并行上传）；
+   uid 在 POST 创建成功后才由 tus-js-client 写入 url，因此这里每轮重新解析。*/
+function startBeat(t){
+  stopBeat(t);
+  const tick = () => {
+    const u = taskUid(t);
+    if (u) beatOnce(u, t.uploaded || 0, t.speed || 0);
+  };
+  t._beatTimer = setInterval(tick, 1500);
+  setTimeout(tick, 300);
+  setTimeout(tick, 1200);
 }
-function startBeat(uid){
-  beatOnce(uid);
-  if (!heartbeatTimer) heartbeatTimer = setInterval(() => beatOnce(uid), 30000);
+function stopBeat(t){
+  if (t._beatTimer) { clearInterval(t._beatTimer); t._beatTimer = null; }
+  const u = taskUid(t);
+  if (u) fetch('/api/active/' + u, {method: 'DELETE'}).catch(() => {});
 }
 function taskUid(t){
-  if (t.upload && t.upload.url) {
-    const m = String(t.upload.url).match(/([0-9a-f]{8,64})$/);
-    if (m) return m[1];
-  }
-  if (t.resumeUrl) {
-    const m = String(t.resumeUrl).match(/([0-9a-f]{8,64})$/);
-    if (m) return m[1];
-  }
-  return '';
+  let url = '';
+  if (t.upload && t.upload.url) url = String(t.upload.url);
+  if (!url && t.resumeUrl) url = String(t.resumeUrl);
+  const m = url.match(/([0-9a-f]{8,64})(?:\\?|$)/);
+  return m ? m[1] : '';
 }
 
 function taskRow(t){
@@ -769,7 +849,7 @@ async function startTask(t){
     t.status = STATE.UPLOADING;
     t.upload.start();
     renderTask(t);
-    startBeat(taskUid(t));
+    startBeat(t);
     refreshPending();      // 立即刷新：恢复上传后该任务不应再出现在"未完成"
     return;
   }
@@ -817,7 +897,7 @@ async function startTask(t){
         return;
       }
       t.status = STATE.ERROR;
-      stopBeat(taskUid(t));
+      stopBeat(t);
       t.st.textContent = '失败：' + (err && err.message ? err.message : '未知错误');
       renderTask(t);
       refreshPending();
@@ -837,10 +917,13 @@ async function startTask(t){
       t.st.textContent = p.toFixed(2) + '%  (' + fmt(uploaded) + ' / ' + fmt(total) + ')'
         + '  速度 ' + t.speed.toFixed(1) + ' MB/s';
       if (t.status !== STATE.UPLOADING) { t.status = STATE.UPLOADING; renderTask(t); }
+      // 实时上报进度，供其他设备（程序端窗口 / 其它浏览器）同步显示
+      if (t._beatTimer) { const u = taskUid(t); if (u) beatOnce(u, uploaded, t.speed); }
+      scheduleRemoteRefresh();
     },
     onSuccess(){
       t.status = STATE.COMPLETED;
-      stopBeat(taskUid(t));
+      stopBeat(t);
       t.bar.style.width = '100.00%';
       t.pct.textContent = '100.00%';
       t.st.textContent = '上传完成';
@@ -859,14 +942,14 @@ async function startTask(t){
   t.status = STATE.UPLOADING;
   renderTask(t);
   t.upload.start();
-  startBeat(taskUid(t));
+  startBeat(t);
   setTimeout(refreshPending, 1200);
 }
 
 function pauseTask(t){
   if (t.upload) { t.upload.abort(); }
   t.status = STATE.PAUSED;          // 主动暂停：此时才允许进入"未完成任务"
-  stopBeat(taskUid(t));
+  stopBeat(t);
   const p = t.file.size ? Math.min(100, (t.uploaded || 0) / t.file.size * 100) : 0;
   t.st.textContent = '已暂停 · ' + p.toFixed(2) + '%（进度已保留）';
   renderTask(t);
@@ -875,11 +958,10 @@ function pauseTask(t){
 
 async function deleteTask(t){
   if (!confirm('删除该上传任务？已上传的分片数据也会被清除。')) return;
-  stopBeat(taskUid(t));
-  // 若服务端已有分片，调用终止接口清理干净
-  if (t.upload && t.upload.url) {
-    try { await fetch(t.upload.url, {method: 'DELETE'}); } catch (e) {}
-  }
+  stopBeat(t);
+  // 若服务端已有分片，调用终止接口彻底清理（含 .info 与分片文件）
+  const gone = taskUid(t);
+  if (gone) { try { await fetch('/api/pending/' + gone, {method: 'DELETE'}); } catch (e) {} }
   t.el.remove();
   const i = TASKS.indexOf(t);
   if (i >= 0) TASKS.splice(i, 1);
@@ -902,6 +984,40 @@ function addFiles(files){
     document.getElementById('up').appendChild(taskRow(t));
     startTask(t);
   });
+}
+
+/* ---------------- 其他设备正在上传（跨设备进度同步，只读） ---------------- */
+let remoteTimer = null;
+function scheduleRemoteRefresh(){
+  if (remoteTimer) return;
+  remoteTimer = setTimeout(() => { remoteTimer = null; refreshRemote(); }, 1000);
+}
+
+async function refreshRemote(){
+  const box = document.getElementById('remote');
+  if (!box) return;
+  let d;
+  try {
+    d = await (await fetch('/api/active')).json();
+  } catch (e) { return; }
+  const mine = new Set(TASKS.map(taskUid).filter(Boolean));
+  const items = (d.active || []).filter(a => !mine.has(a.uid));
+  document.getElementById('remoteCard').hidden = items.length === 0;
+  box.innerHTML = items.map(a => {
+    const pct = a.size ? Math.min(100, a.uploaded / a.size * 100) : 0;
+    const pctTxt = pct.toFixed(2);
+    const who = [a.client_name, a.client_ip].filter(Boolean).join(' / ') || '未知设备';
+    return '<div class="row">'
+      + '<div class="hd"><span class="nm">' + esc(a.name) + '</span>'
+      + '<span class="pct">' + pctTxt + '%</span></div>'
+      + '<div class="sz">来自 ' + esc(who)
+      + '　已传 ' + fmt(a.uploaded) + ' / ' + fmt(a.size)
+      + (a.speed > 0 ? '　速度 ' + a.speed.toFixed(1) + ' MB/s' : '')
+      + '</div>'
+      + '<div class="bar"><i style="width:' + pctTxt + '%"></i></div>'
+      + '<div class="st">对方上传中 · 进度已同步</div>'
+      + '</div>';
+  }).join('');
 }
 
 /* ---------------- 未完成任务（程序异常关闭后残留） ---------------- */
@@ -1088,9 +1204,11 @@ async function refresh(){
 }
 refresh();
 refreshPending();
+refreshRemote();
 renderTips();
 setInterval(refresh, 3000);
 setInterval(refreshPending, 3000);
+setInterval(refreshRemote, 1500);
 </script>
 </body>
 </html>
@@ -1255,16 +1373,39 @@ def create_app() -> FastAPI:
         return {"pending": items, "count": len(items)}
 
     @app.post("/api/active/{uid}")
-    async def api_active(uid: str):
-        """客户端心跳：声明"这个任务正在上传"。
+    async def api_active(uid: str, request: Request):
+        """客户端心跳：声明"这个任务正在上传"，并上报当前进度与速度。
 
-        页面在上传期间定时调用；页面关闭 / 崩溃 / 断网后心跳停止，
+        页面 / 程序端在上传期间定期调用；页面关闭、崩溃或断网后心跳停止，
         服务端就把该任务重新归入"未完成"，从而不会与"上传中"列表重复。
+
+        同时这些进度数据会通过 /api/active 广播给**其他设备**，
+        使程序端窗口与其它浏览器都能看到同一个上传任务的实时进度。
         """
         if not re.fullmatch(r"[0-9a-f]{8,64}", uid or ""):
             raise HTTPException(status_code=400, detail="任务 ID 非法")
-        mark_active(uid)
+        payload = {}
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        mark_active(uid,
+                    uploaded=int(payload.get("uploaded") or 0),
+                    speed=float(payload.get("speed") or 0.0))
+        if request.client:
+            CLIENT_MAP[uid] = request.client.host
         return {"ok": True, "ttl": ACTIVE_TTL}
+
+    @app.get("/api/active")
+    async def api_active_list(request: Request):
+        """当前所有正在上传的任务（含进度与速度），供其它设备同步显示。"""
+        items = await asyncio.to_thread(list_active_uploads)
+        mine = request.query_params.get("exclude") or ""
+        if mine:
+            items = [i for i in items if i["uid"] != mine]
+        return {"active": items, "count": len(items)}
 
     @app.delete("/api/active/{uid}")
     async def api_inactive(uid: str):

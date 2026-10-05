@@ -208,8 +208,9 @@ def disk_free(path: str) -> int:
 DEVICE_CACHE: dict = {}      # ip -> {"name": str, "mac": str}
 DEVICE_CACHE_TTL = 60        # 缓存秒数
 CLIENT_MAP: dict = {}        # 上传 ID(uid) -> 客户端 IP，由 HTTP 中间件登记
-ACTIVE_UPLOADS: dict = {}    # uid -> 最后一次心跳时间戳，用于区分"正在上传"与"已中断"
+ACTIVE_UPLOADS: dict = {}    # uid -> {"ts":…, "uploaded":…, "speed":…}，区分"正在上传"与"已中断"
 ACTIVE_TTL = 90              # 心跳超过该秒数未刷新，视为上传已中断（页面关闭/崩溃/断网）
+PAUSED_UIDS: dict = {}        # uid -> 操作者 IP，被要求暂停的上传（等客户端心跳确认）
 
 
 def _mac_of(ip: str) -> str:
@@ -322,6 +323,25 @@ def mark_active(uid: str, uploaded: int = 0, speed: float = 0.0):
 def mark_inactive(uid: str):
     """取消"正在上传"标记（暂停 / 完成 / 删除时调用）。"""
     ACTIVE_UPLOADS.pop(uid, None)
+
+
+def task_owner(uid: str) -> str:
+    """任务所有者（首次创建上传的客户端 IP）。"""
+    return CLIENT_MAP.get(uid, "")
+
+
+def check_owner(uid: str, request: Request):
+    """权限校验：只有任务**所有者**才能暂停 / 继续 / 删除该任务。
+
+    CLIENT_MAP 只在创建上传（POST）时写入、后续心跳不覆盖，
+    因此这里能准确判断"这个任务是谁的"。所有者未知（老任务）时放行。
+    """
+    owner = task_owner(uid)
+    who = request.client.host if request.client else ""
+    if owner and who != owner:
+        raise HTTPException(
+            status_code=403,
+            detail=f"只能操作自己上传的任务（该任务来自 {owner}）")
 
 
 def list_active_uploads() -> list:
@@ -781,7 +801,38 @@ function beatOnce(uid, uploaded, speed){
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({uploaded: uploaded || 0, speed: speed || 0})
+  }).then(r => r.json()).then(d => {
+    if (!d || d.ok === false) return;
+    // 服务端回执：被本机窗口或其它设备请求暂停
+    if (d.paused) applyRemotePause(uid);
+    // 服务端已删除该任务（.info 不存在）—— 停止重试，标记为已取消
+    if (d.alive === false) applyRemoteDelete(uid);
   }).catch(() => {});
+}
+
+/* 服务端要求暂停：停止发送分片，进度保留 */
+function applyRemotePause(uid){
+  const t = TASKS.find(x => taskUid(x) === uid);
+  if (!t || t.status !== STATE.UPLOADING) return;
+  try { t.upload.abort(); } catch (e) {}
+  t.status = STATE.PAUSED;
+  stopBeat(t);
+  t.st.textContent = '已被暂停（进度已保留）';
+  renderTask(t);
+  toast('已在电脑端暂停该上传');
+  refreshPending();
+}
+
+/* 服务端已删除该任务：停止一切重试（不再自动重建） */
+function applyRemoteDelete(uid){
+  const t = TASKS.find(x => taskUid(x) === uid);
+  if (!t) return;
+  stopBeat(t);
+  t.killed = true;                 // 阻止 404 后的自动重建
+  t.status = STATE.ERROR;
+  t.st.textContent = '任务已被删除';
+  renderTask(t);
+  toast('该上传任务已被删除');
 }
 /* 每个任务各自维护心跳（支持多任务并行上传）；
    uid 在 POST 创建成功后才由 tus-js-client 写入 url，因此这里每轮重新解析。*/
@@ -887,9 +938,9 @@ async function startTask(t){
                 filetype: t.file.type || 'application/octet-stream' },
     onError(err){
       const code = err && err.originalResponse ? err.originalResponse.getStatus() : 0;
-      if (code === 404 && !t.retried) {
-        // 服务端的这个任务已被删除（过期清理/手动删除）：
-        // 丢掉旧地址，重新建一个上传接着传
+      if (code === 404 && !t.retried && !t.killed) {
+        // 服务端这个任务已不存在（过期清理 / 被删除）：
+        // 若已被本机窗口主动删除则不再重建，否则换一个任务地址重建续传
         t.retried = true;
         t.upload = null;
         t.resumeUrl = null;
@@ -1394,9 +1445,39 @@ def create_app() -> FastAPI:
         mark_active(uid,
                     uploaded=int(payload.get("uploaded") or 0),
                     speed=float(payload.get("speed") or 0.0))
-        if request.client:
+        # 注意：这里**不能**覆盖 CLIENT_MAP —— 所有者以创建上传时的 IP 为准，
+        # 否则任何设备刷新心跳都会被当成所有者，从而绕过权限校验。
+        if request.client and not task_owner(uid):
             CLIENT_MAP[uid] = request.client.host
-        return {"ok": True, "ttl": ACTIVE_TTL}
+        # 回传控制指令：被其它设备暂停 / 任务已被删除
+        alive = os.path.isfile(os.path.join(TUS_DIR, uid + ".info"))
+        return {"ok": True, "ttl": ACTIVE_TTL,
+                "paused": uid in PAUSED_UIDS, "alive": alive}
+
+    @app.post("/api/pause/{uid}")
+    async def api_pause(uid: str, request: Request):
+        """请求暂停某个上传（仅限任务所有者）。
+
+        TUS 协议没有"服务端强制暂停"的能力，这里采用心跳回执方式：
+        标记后客户端下一次心跳会收到 paused=true 并主动停止发送分片。
+        """
+        if not re.fullmatch(r"[0-9a-f]{8,64}", uid or ""):
+            raise HTTPException(status_code=400, detail="任务 ID 非法")
+        check_owner(uid, request)
+        if not os.path.isfile(os.path.join(TUS_DIR, uid + ".info")):
+            raise HTTPException(status_code=404, detail="任务不存在")
+        PAUSED_UIDS[uid] = request.client.host if request.client else ""
+        mark_inactive(uid)          # 立刻从"正在上传"列表中消失
+        return {"ok": True, "requested": True}
+
+    @app.post("/api/resume/{uid}")
+    async def api_resume(uid: str, request: Request):
+        """取消暂停标记（仅限任务所有者）。"""
+        if not re.fullmatch(r"[0-9a-f]{8,64}", uid or ""):
+            raise HTTPException(status_code=400, detail="任务 ID 非法")
+        check_owner(uid, request)
+        PAUSED_UIDS.pop(uid, None)
+        return {"ok": True}
 
     @app.get("/api/active")
     async def api_active_list(request: Request):
@@ -1411,13 +1492,18 @@ def create_app() -> FastAPI:
     async def api_inactive(uid: str):
         """取消"正在上传"标记（暂停 / 完成 / 删除时调用）。"""
         mark_inactive(uid)
+        PAUSED_UIDS.pop(uid, None)
         return {"ok": True}
 
     @app.delete("/api/pending/{uid}")
-    async def api_drop_pending(uid: str):
-        """删除某个未完成任务的临时分片（终止上传，不动已完成的文件）。"""
+    async def api_drop_pending(uid: str, request: Request):
+        """删除某个未完成任务的临时分片（终止上传，不动已完成的文件）。
+
+        仅限任务所有者操作，避免误删他人正在上传的任务。
+        """
         if not re.fullmatch(r"[0-9a-f]{8,64}", uid or ""):
             raise HTTPException(status_code=400, detail="任务 ID 非法")
+        check_owner(uid, request)
         removed = False
         for suffix in ("", ".info"):
             path = os.path.join(TUS_DIR, uid + suffix)
@@ -1429,6 +1515,7 @@ def create_app() -> FastAPI:
                     raise HTTPException(status_code=500, detail=f"删除失败：{exc}") from exc
         CLIENT_MAP.pop(uid, None)
         mark_inactive(uid)
+        PAUSED_UIDS.pop(uid, None)
         if not removed:
             raise HTTPException(status_code=404, detail="任务不存在")
         return {"ok": True}

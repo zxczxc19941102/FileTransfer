@@ -30,7 +30,7 @@ from store import UPLOAD_DIR, create_app, disk_free, human_size
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # 打包成 exe 后 __file__ 指向临时解压目录，必须改用 exe 所在目录
 if getattr(sys, "frozen", False):
-    BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
+    BASE_DIR: str = os.path.dirname(os.path.abspath(sys.executable))
 
 QR_PATH = os.path.join(BASE_DIR, "lan_qrcode.png")
 SERVER_IP = "127.0.0.1"   # 启动后写入真实内网 IP
@@ -94,6 +94,7 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
     本机上传任务列表（持久化 + 右键：继续执行 / 下载 / 暂停 / 删除），
     关闭时若有上传任务会两次确认。
     """
+    import json
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
 
@@ -101,13 +102,15 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
 
     from store import (human_size, list_active_uploads, local_machine_info,
                    read_all_meta, scan_pending_uploads)
-    from uploader import UploadTask, load_local_tasks, save_local_tasks
+    from uploader import LOCAL_TASK_FILE, UploadTask, load_local_tasks, save_local_tasks
 
     root = tk.Tk()
     root.title("局域网文件传输工具 - 电脑端")
     root.geometry("900x780")
     root.configure(bg="#0f1220")
     machine = local_machine_info()
+    # 上传任务的浏览器端 uid（用于把本机任务与网页"继续"联动）
+    WEB_UID = {}
 
     # ---------------------------------------------------------- 顶部信息
     tk.Label(root, text="局域网文件传输工具", bg="#0f1220", fg="#eef1ff",
@@ -143,6 +146,25 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
     tree.pack(side="left", fill="both", expand=True)
     vsb.pack(side="right", fill="y")
 
+    live_info = {}          # uid -> 活跃上传信息（传输中任务）
+
+    def local_uids() -> set:
+        """本机上传器占用的任务 ID（只有这些任务允许本机暂停/删除）。"""
+        out = set()
+        for rec in tasks.values():
+            u = rec["task"]._uid()
+            if u:
+                out.add(u)
+        return out
+
+    def is_mine(uid: str) -> bool:
+        """该任务是否由本机发起（本机发起 = 可操作；他人发起 = 只读）。"""
+        if uid in local_uids():
+            return True
+        info = live_info.get(uid) or {}
+        ip = info.get("client_ip") or ""
+        return ip in ("127.0.0.1", "::1", "localhost")
+
     def refresh_tree():
         for item in tree.get_children():
             tree.delete(item)
@@ -151,8 +173,12 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
             for a in list_active_uploads():
                 pct = min(100.0, a["uploaded"] / a["size"] * 100) if a["size"] else 0.0
                 who = a.get("client_name") or a.get("client_ip") or "未知设备"
-                tree.insert("", "end", iid="live_" + a["uid"], values=(
-                    a["name"], human_size(a["size"]), f"上传中 {pct:.2f}%", "传输中…",
+                uid = a["uid"]
+                live_info[uid] = a
+                mine = (uid in local_uids())
+                tree.insert("", "end", iid="live_" + uid, values=(
+                    a["name"], human_size(a["size"], ), f"上传中 {pct:.2f}%",
+                    ("本机上传" if mine else "传输中…"),
                     a.get("client_ip") or "-", who, a.get("client_mac") or "-"))
         except Exception:
             pass
@@ -162,19 +188,87 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
                 rec.get("client_ip") or "-", rec.get("client_name") or "-",
                 rec.get("client_mac") or "-"))
 
+    def api_call(method: str, path: str):
+        """调用本机服务接口。
+
+        请求走 127.0.0.1，因此在服务端看来属于"本机"，对本机发起的
+        任务拥有操作权限；他人的任务会被 403 拒绝。
+        """
+        import http.client
+        import json as _json
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=20)
+            conn.request(method, path)
+            resp = conn.getresponse()
+            body = resp.read()
+            conn.close()
+            data = _json.loads(body.decode("utf-8")) if body else {}
+            if resp.status >= 400:
+                return False, data.get("detail", f"HTTP {resp.status}")
+            return True, data
+        except Exception as exc:
+            return False, str(exc)
+
     def rec_path(file_id: str) -> str:
         for r in read_all_meta():
             if r["id"] == file_id:
                 return r.get("path", "")
         return ""
 
+    def pause_remote(uid: str):
+        """请求暂停传输中的任务（通过心跳回执同步到对方的页面/程序）。"""
+        ok, msg = api_call("POST", f"/api/pause/{uid}")
+        if ok:
+            messagebox.showinfo("已请求暂停", "已通知对方：任务将在其下次心跳时暂停。")
+        else:
+            messagebox.showwarning("无法暂停", str(msg))
+
+    def resume_remote(uid: str):
+        """请求继续传输中的任务。"""
+        ok, msg = api_call("POST", f"/api/resume/{uid}")
+        if ok:
+            messagebox.showinfo("已请求继续", "已通知对方继续上传。")
+        else:
+            messagebox.showwarning("无法继续", str(msg))
+
+    def drop_remote(uid: str):
+        """删除传输中的任务（清除其已上传的分片）。"""
+        if not messagebox.askyesno("删除任务",
+                "删除该上传任务？\n已上传的分片数据也会被清除，且不可恢复。"):
+            return
+        ok, msg = api_call("DELETE", f"/api/pending/{uid}")
+        if ok:
+            messagebox.showinfo("已删除", "该上传任务已删除")
+        else:
+            messagebox.showwarning("删除失败", str(msg))
+
     def on_rec_right_click(event):
-        """已接收文件：右键菜单（取消双击下载，单击仅选中）。"""
+        """已接收文件：右键菜单。
+
+        传输中的任务（live_ 前缀）也支持暂停 / 继续 / 删除，
+        且**仅允许操作本机发起的任务**；他人任务只读。
+        """
         iid = tree.identify_row(event.y)
         if not iid:
             return
         tree.selection_set(iid)
         menu = tk.Menu(root, tearoff=0)
+        if iid.startswith("live_"):
+            uid = iid[5:]
+            info = live_info.get(uid) or {}
+            who = info.get("client_ip") or "其它设备"
+            if is_mine(uid):
+                menu.add_command(label="暂停上传", command=lambda: pause_remote(uid))
+                menu.add_command(label="继续上传", command=lambda: resume_remote(uid))
+                menu.add_separator()
+                menu.add_command(label="删除任务（清除分片）", command=lambda: drop_remote(uid))
+            else:
+                menu.add_command(label="等待上传完成…", state="disabled")
+                menu.add_separator()
+                menu.add_command(label=f"只能操作自己的任务（该任务来自 {who}）",
+                                 state="disabled")
+            menu.post(event.x_root, event.y_root)
+            return
         menu.add_command(label="下载到本机",
                          command=lambda: webbrowser.open(f"http://127.0.0.1:{port}/files/{iid}"))
         menu.add_command(label="下载并选择保存位置",
@@ -257,6 +351,19 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
                   "done": "已完成", "failed": "失败", "canceled": "已取消",
                   "interrupted": "已中断"}
 
+    def task_state_text(t):
+        if t.status == "running":
+            return "上传中"
+        if t.status in ("paused",):
+            return "已暂停"
+        if t.status == "failed":
+            return "失败"
+        if t.status == "done":
+            return "已完成"
+        if t.status == "canceled":
+            return "已取消"
+        return "排队中"
+
     def pct_text(uploaded, size):
         """双精度百分比，保留两位小数。"""
         if not size:
@@ -325,7 +432,7 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
         rec = tasks.get(iid)
         if not rec:
             return
-        path, size = rec["path"], rec["task"].size
+        path, size, mtime = rec["path"], rec["task"].size, rec.get("mtime", 0)
         if not os.path.isfile(path):
             if not messagebox.askyesno(
                     "原文件不存在",

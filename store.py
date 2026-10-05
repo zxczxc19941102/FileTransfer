@@ -60,6 +60,8 @@ TUS_JS_PATH = os.path.join(RES_DIR, "tus.min.js")     # 内置的 tus-js-client
 NO_SIZE_LIMIT = 1 << 62
 CHUNK_READ = 4 * 1024 * 1024        # 计算哈希时的读取块大小（4MB）
 EXPIRE_DAYS = 30                    # 未完成分片保留天数（大文件跨天传输常见，留足时间）
+ORPHAN_KEEP_HOURS = 1               # 孤立分片（无 .info）保留小时数，超时即回收
+PURGE_INTERVAL = 5                  # 已删除任务的残留分片复查间隔（秒）
 MEMORY_PEAK = {"value": 0.0}         # 进程内存峰值（MB），由后台任务更新
 SERVER_IP = "127.0.0.1"             # 启动后写入真实内网 IP
 SERVER_PORT = 8000                  # 启动后写入真实端口
@@ -330,18 +332,51 @@ def task_owner(uid: str) -> str:
     return CLIENT_MAP.get(uid, "")
 
 
+def local_host_addresses() -> set:
+    """本机所有可能的来源 IP（回环 + 各网卡地址）。
+
+    用途：用户用 http://192.168.x.x:端口 访问本机服务时，任务的所有者是
+    该局域网 IP；而程序端（GUI）通过 http://127.0.0.1:端口 操作同一个任务。
+    两者其实是同一台电脑，必须都视为所有者，否则程序端右键删除/暂停会 403。
+    """
+    hosts = {"127.0.0.1", "::1", "localhost", "0.0.0.0"}
+    try:
+        from netutils import get_lan_ip, list_lan_ips
+        hosts.add(get_lan_ip())
+        hosts.update(list_lan_ips())
+    except Exception:
+        pass
+    for probe in (("8.8.8.8", 80), ("114.114.114.114", 53)):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(0.2)
+            sock.connect(probe)
+            hosts.add(sock.getsockname()[0])
+            sock.close()
+        except OSError:
+            pass
+    return {h for h in hosts if h}
+
+
+LOCAL_HOSTS = local_host_addresses()
+
+
 def check_owner(uid: str, request: Request):
     """权限校验：只有任务**所有者**才能暂停 / 继续 / 删除该任务。
 
     CLIENT_MAP 只在创建上传（POST）时写入、后续心跳不覆盖，
-    因此这里能准确判断"这个任务是谁的"。所有者未知（老任务）时放行。
+    因此这里能准确判断"这个任务是谁的"。所有者未知（老任务）时放行；
+    来自本机任一地址（回环或本机局域网 IP）的请求一律视为所有者。
     """
     owner = task_owner(uid)
-    who = request.client.host if request.client else ""
-    if owner and who != owner:
-        raise HTTPException(
-            status_code=403,
-            detail=f"只能操作自己上传的任务（该任务来自 {owner}）")
+    who = (request.client.host if request.client else "") or ""
+    if not owner or who == owner:
+        return
+    if who in LOCAL_HOSTS:
+        return
+    raise HTTPException(
+        status_code=403,
+        detail=f"只能操作自己上传的任务（该任务来自 {owner}）")
 
 
 def list_active_uploads() -> list:
@@ -616,6 +651,36 @@ async def on_upload_complete(file_path: str, info: dict):
 # ==========================================================================
 
 
+# 已删除任务的 uid -> 复查截止时间戳。
+# 客户端 abort() 与服务端删除分片之间存在竞态：abort 之后 tus 仍可能发出
+# 最后一次 PATCH，重新创建出一个没有 .info 的孤立分片。这里在删除后的一小段
+# 时间内反复复查，确保残留被清干净（否则要等过期清理才回收）。
+PURGE_QUEUE: dict = {}
+
+
+def queue_purge(uid: str, seconds: int = 30) -> None:
+    """登记一个需要在随后若干秒内反复清理的任务 ID。"""
+    PURGE_QUEUE[uid] = time.time() + seconds
+
+
+def purge_once() -> int:
+    """清理 PURGE_QUEUE 中登记的残留分片，返回删除的文件数。"""
+    removed = 0
+    now = time.time()
+    for uid, until in list(PURGE_QUEUE.items()):
+        for suffix in ("", ".info"):
+            path = os.path.join(TUS_DIR, uid + suffix)
+            if os.path.isfile(path):
+                try:
+                    os.remove(path)
+                    removed += 1
+                except OSError:
+                    pass
+        if now >= until:
+            PURGE_QUEUE.pop(uid, None)
+    return removed
+
+
 def cleanup_expired(days: int = EXPIRE_DAYS) -> int:
     """清理超过保留期的未完成分片，返回清理的文件数。
 
@@ -626,6 +691,7 @@ def cleanup_expired(days: int = EXPIRE_DAYS) -> int:
     removed = 0
     now = datetime.now()
     deadline = now - timedelta(days=days)
+    orphan_deadline = now - timedelta(hours=ORPHAN_KEEP_HOURS)
     from email.utils import parsedate_to_datetime
 
     for name in os.listdir(TUS_DIR):
@@ -649,8 +715,11 @@ def cleanup_expired(days: int = EXPIRE_DAYS) -> int:
                 continue
         else:
             uid = name
+            # 孤立分片（没有 .info）：正常上传一定伴随 .info，出现孤立分片
+            # 说明上传已被终止，多半是客户端 abort 与服务端删除之间的竞态残留，
+            # 用更短的阈值回收即可，不必等满整个保留期。
             try:
-                if datetime.fromtimestamp(os.path.getmtime(path)) >= deadline:
+                if datetime.fromtimestamp(os.path.getmtime(path)) >= orphan_deadline:
                     continue
             except OSError:
                 continue
@@ -791,6 +860,31 @@ const STATE_TEXT = {
 const TASKS = [];   // {file, upload, el, status, uid}
 let pendingResume = null;   // 点「继续」后待绑定的未完成任务
 
+/* 记住"本标签页发起过的上传 ID"。
+   刷新页面后 TASKS 会清空，若只靠它判断，自己正在传的任务会被
+   「其他设备正在上传」误报成别人的。用 sessionStorage 持久化，
+   刷新后仍能认出；标签页关闭后自动失效。*/
+const MY_UIDS_KEY = 'lan_transfer_my_uids';
+function myUids(){
+  try { return new Set(JSON.parse(sessionStorage.getItem(MY_UIDS_KEY) || '[]')); }
+  catch (e) { return new Set(); }
+}
+function rememberUid(uid){
+  if (!uid) return;
+  try {
+    const s = myUids();
+    if (!s.has(uid)) { s.add(uid); sessionStorage.setItem(MY_UIDS_KEY, JSON.stringify([...s])); }
+  } catch (e) {}
+}
+function forgetUid(uid){
+  if (!uid) return;
+  try {
+    const s = myUids();
+    s.delete(uid);
+    sessionStorage.setItem(MY_UIDS_KEY, JSON.stringify([...s]));
+  } catch (e) {}
+}
+
 /* 心跳：声明"该任务正在上传"，让服务端不要把它算作未完成任务。
    页面关闭 / 崩溃 / 断网后心跳停止，任务自动回到「未完成」列表。*/
 let heartbeatTimer = null;
@@ -839,15 +933,19 @@ function applyRemoteDelete(uid){
 function startBeat(t){
   stopBeat(t);
   const tick = () => {
+    if (t._beatStopped) return;   // 已停止：不再补发，避免删除后记录被重新写活
     const u = taskUid(t);
-    if (u) beatOnce(u, t.uploaded || 0, t.speed || 0);
+    if (u) { rememberUid(u); beatOnce(u, t.uploaded || 0, t.speed || 0); }
   };
+  t._beatStopped = false;
   t._beatTimer = setInterval(tick, 1500);
-  setTimeout(tick, 300);
-  setTimeout(tick, 1200);
+  // 这两次"立即补发"也要能取消，否则删除后仍会再发一次心跳
+  t._beatOnce = [setTimeout(tick, 300), setTimeout(tick, 1200)];
 }
 function stopBeat(t){
+  t._beatStopped = true;
   if (t._beatTimer) { clearInterval(t._beatTimer); t._beatTimer = null; }
+  if (t._beatOnce) { t._beatOnce.forEach(clearTimeout); t._beatOnce = null; }
   const u = taskUid(t);
   if (u) fetch('/api/active/' + u, {method: 'DELETE'}).catch(() => {});
 }
@@ -1009,14 +1107,21 @@ function pauseTask(t){
 
 async function deleteTask(t){
   if (!confirm('删除该上传任务？已上传的分片数据也会被清除。')) return;
+  t.killed = true;                      // 阻止 404 后自动重建
   stopBeat(t);
+  // 关键：真正中止上传。只把卡片从界面移除的话，tus 仍会在后台继续传
+  try { if (t.upload) t.upload.abort(); } catch (e) {}
   // 若服务端已有分片，调用终止接口彻底清理（含 .info 与分片文件）
   const gone = taskUid(t);
-  if (gone) { try { await fetch('/api/pending/' + gone, {method: 'DELETE'}); } catch (e) {} }
+  if (gone) {
+    forgetUid(gone);
+    try { await fetch('/api/pending/' + gone, {method: 'DELETE'}); } catch (e) {}
+  }
   t.el.remove();
   const i = TASKS.indexOf(t);
   if (i >= 0) TASKS.splice(i, 1);
   refreshPending();
+  refreshRemote();
 }
 
 function addFiles(files){
@@ -1051,7 +1156,8 @@ async function refreshRemote(){
   try {
     d = await (await fetch('/api/active')).json();
   } catch (e) { return; }
-  const mine = new Set(TASKS.map(taskUid).filter(Boolean));
+  // 自己的任务 = 当前页面上传中的 + 本标签页历史上传过的（刷新后仍在 sessionStorage）
+  const mine = new Set([...TASKS.map(taskUid).filter(Boolean), ...myUids()]);
   const items = (d.active || []).filter(a => !mine.has(a.uid));
   document.getElementById('remoteCard').hidden = items.length === 0;
   box.innerHTML = items.map(a => {
@@ -1230,15 +1336,22 @@ async function refresh(){
     d = await (await fetch('/api/files')).json();
   } catch (e) { return; }
   document.getElementById('rows').innerHTML = d.files.map(f =>
-    '<tr onclick="location.href=/files/' + encodeURIComponent(f.id) + '">'
+    '<tr class="file-row" data-id="' + esc(f.id) + '">'
     + '<td>' + esc(f.name) + '</td>'
     + '<td>' + fmt(f.size) + '</td>'
     + '<td>' + f.uploaded_at + '</td>'
     + '<td>' + esc(f.client_ip || '-') + '</td>'
     + '<td>' + esc(f.client_name || '-') + '</td>'
     + '<td><span class="tag">' + esc(f.client_mac || '-') + '</span></td>'
-    + '<td><button class="mini" data-del="' + f.id + '">删记录</button></td>'
+    + '<td><button class="mini" data-del="' + esc(f.id) + '">删记录</button></td>'
     + '</tr>').join('');
+  // 下载绑定改用事件委托：内联 onclick 里写 location.href=/files/xxx 会被
+  // JS 解析成正则字面量而报语法错误，导致点击无反应
+  document.querySelectorAll('#rows tr.file-row').forEach(tr => {
+    tr.onclick = () => {
+      location.href = '/files/' + encodeURIComponent(tr.dataset.id);
+    };
+  });
   document.querySelectorAll('button[data-del]').forEach(b => {
     b.onclick = async (ev) => {
       ev.stopPropagation();
@@ -1260,6 +1373,18 @@ renderTips();
 setInterval(refresh, 3000);
 setInterval(refreshPending, 3000);
 setInterval(refreshRemote, 1500);
+
+/* 页面刷新 / 关闭时立即释放「上传中」标记。
+   否则服务端要等心跳超时（约 90 秒）才把任务归入「未完成」，这段时间里
+   任务既不在上传中、也不在未完成处，容易让人以为文件丢了。
+   上传本身会随页面卸载而中断，这里只负责让它尽快回到「可继续」列表。*/
+window.addEventListener('beforeunload', () => {
+  TASKS.forEach(t => {
+    const u = taskUid(t);
+    if (!u) return;
+    try { fetch('/api/active/' + u, {method: 'DELETE', keepalive: true}); } catch (e) {}
+  });
+});
 </script>
 </body>
 </html>
@@ -1516,9 +1641,9 @@ def create_app() -> FastAPI:
         CLIENT_MAP.pop(uid, None)
         mark_inactive(uid)
         PAUSED_UIDS.pop(uid, None)
-        if not removed:
-            raise HTTPException(status_code=404, detail="任务不存在")
-        return {"ok": True}
+        queue_purge(uid)   # 客户端 abort 有竞态，随后几秒反复复查残留分片
+        # 幂等：任务可能刚完成或已被删过，这种情况同样视为删除成功
+        return {"ok": True, "removed": removed}
 
     @app.delete("/api/record/{file_id}")
     async def api_delete_record(file_id: str):
@@ -1555,13 +1680,25 @@ def create_app() -> FastAPI:
 
 
 async def _gc_loop():
-    """后台任务：每小时清理一次过期分片。"""
+    """后台任务：定期回收磁盘。
+
+    - 每 PURGE_INTERVAL 秒复查一次"已删除任务"的竞态残留分片（轻量）；
+    - 每小时做一次全量过期清理（含跨天未完成的大文件分片）。
+    """
+    rounds = 0
+    per_hour = max(1, 3600 // PURGE_INTERVAL)
     while True:
         try:
-            await asyncio.to_thread(cleanup_expired)
+            await asyncio.to_thread(purge_once)
         except Exception:
             pass
-        await asyncio.sleep(3600)
+        if rounds % per_hour == 0:
+            try:
+                await asyncio.to_thread(cleanup_expired)
+            except Exception:
+                pass
+        rounds += 1
+        await asyncio.sleep(PURGE_INTERVAL)
 
 
 async def _memory_watch():

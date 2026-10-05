@@ -101,7 +101,7 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
     from PIL import Image, ImageTk
 
     from store import (human_size, list_active_uploads, local_machine_info,
-                   read_all_meta, scan_pending_uploads)
+                       meta_path, read_all_meta, scan_pending_uploads)
     from uploader import LOCAL_TASK_FILE, UploadTask, load_local_tasks, save_local_tasks
 
     root = tk.Tk()
@@ -148,6 +148,20 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
 
     live_info = {}          # uid -> 活跃上传信息（传输中任务）
 
+    # 本机身份：用 127.0.0.1 或本机局域网 IP（如 192.168.1.100）打开页面，
+    # 都算「本机发起的任务」。否则用局域网 IP 访问自己时，自己传的文件
+    # 会被误判成"其他设备"而无法暂停/删除。
+    self_ips = {"127.0.0.1", "::1", "localhost"}
+    try:
+        self_ips.add(get_lan_ip())
+        self_ips.update(list_lan_ips())
+    except Exception:
+        pass
+    try:
+        self_mac = (local_machine_info() or {}).get("mac") or ""
+    except Exception:
+        self_mac = ""
+
     def local_uids() -> set:
         """本机上传器占用的任务 ID（只有这些任务允许本机暂停/删除）。"""
         out = set()
@@ -158,12 +172,17 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
         return out
 
     def is_mine(uid: str) -> bool:
-        """该任务是否由本机发起（本机发起 = 可操作；他人发起 = 只读）。"""
+        """该任务是否由本机发起（本机发起 = 可操作；他人发起 = 只读）。
+
+        依次按三种依据判断：本机上传器持有的 uid、网卡 MAC 一致、
+        来源 IP 属于本机任一网卡地址。MAC 判断最可靠（多网卡也不误判）。
+        """
         if uid in local_uids():
             return True
         info = live_info.get(uid) or {}
-        ip = info.get("client_ip") or ""
-        return ip in ("127.0.0.1", "::1", "localhost")
+        if self_mac and (info.get("client_mac") or "").upper() == self_mac.upper():
+            return True
+        return (info.get("client_ip") or "").strip() in self_ips
 
     def refresh_tree():
         for item in tree.get_children():
@@ -175,7 +194,7 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
                 who = a.get("client_name") or a.get("client_ip") or "未知设备"
                 uid = a["uid"]
                 live_info[uid] = a
-                mine = (uid in local_uids())
+                mine = is_mine(uid)
                 tree.insert("", "end", iid="live_" + uid, values=(
                     a["name"], human_size(a["size"], ), f"上传中 {pct:.2f}%",
                     ("本机上传" if mine else "传输中…"),
@@ -320,8 +339,11 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
                                    f"仅删除任务记录，不删除文件：\n{rec['name']}\n\n确定删除吗？"):
             return
         try:
-            os.remove(os.path.join(os.path.dirname(os.path.dirname(
-                os.path.dirname(rec["path"]))), ".meta", f"{file_id}.json"))
+            # 直接用元数据模块的路径函数，避免手工按层数剥离目录出错
+            # （原先多剥了一层 dirname，拼出的是 f:\meta\xxx.json）
+            os.remove(meta_path(file_id))
+        except FileNotFoundError:
+            pass  # 记录已不存在，等同于删除成功
         except OSError as exc:
             messagebox.showerror("删除失败", str(exc))
             return

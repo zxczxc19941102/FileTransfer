@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 .venv/
+.codebuddy/
 uploads/
 lan_qrcode.png
 build/

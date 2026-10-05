@@ -25,14 +25,17 @@ def main():
         print("[UPX] 压缩已启用 ->", UPX)
     else:
         print("[UPX] 未找到 upx.exe，本次跳过压缩")
-    args += ["--collect-all", "uvicorn",
-             "--collect-all", "multipart",
+    # tus.min.js 必须打进 exe：页面把它内联进去，缺了就只能回退到外网 CDN
+    args += ["--add-data", "tus.min.js" + os.pathsep + ".",
+             "--collect-all", "uvicorn",
              "--collect-all", "fastapi",
              "--collect-all", "starlette",
              "--collect-all", "pydantic",
              "--collect-all", "anyio",
+             "--collect-all", "tuspyserver",
              "--hidden-import", "tkinter",
              "--hidden-import", "PIL",
+             "--hidden-import", "httptools",
              "--hidden-import", "encodings.idna",
              "main.py"]
     if run(args) != 0:

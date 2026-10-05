@@ -1,6 +1,9 @@
-# 局域网文件互传工具依赖（Python 3.9+）
+# 局域网文件传输工具依赖（Python 3.9+）
+# TUS 分片上传方案，支持 100G 级大文件与断点续传
+
 fastapi>=0.110.0
 uvicorn>=0.29.0
-python-multipart>=0.0.9
+httptools>=0.6.0
+tuspyserver>=4.4.0
 qrcode>=7.4.2
 pillow>=10.2.0

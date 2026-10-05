@@ -35,11 +35,29 @@ python -m venv .venv
 ## 三、运行
 
 ```bash
-.venv\Scripts\python.exe main.py                 # 推荐：二维码窗口
-.venv\Scripts\python.exe main.py --port 8080     # 指定端口
-.venv\Scripts\python.exe main.py --no-gui        # 只控制台，打印字符二维码
-.venv\Scripts\python.exe main.py --no-browser    # 不自动打开浏览器
+.venv\Scripts\python.exe run.py                 # 推荐：二维码窗口
+.venv\Scripts\python.exe run.py --port 8080     # 指定端口
+.venv\Scripts\python.exe run.py --no-gui        # 只控制台，打印字符二维码
+.venv\Scripts\python.exe run.py --no-browser    # 不自动打开浏览器
 ```
+
+> **为什么用 `run.py` 而不是 `main.py`**
+>
+> 两者的功能、参数完全一致，区别只在**退出行为**。
+>
+> 上传完成后，服务端会用 `await asyncio.to_thread(sha256_of, 文件)` 计算校验值
+> （见 `store.py`），几十 GB 的文件要跑几分钟。这个调用使用的是 Python 默认
+> 线程池，而该线程池在解释器退出时会**无条件等待所有工作线程结束**。
+>
+> 结果是：如果你在"服务端正在给大文件算 SHA256"时关闭窗口，窗口虽然消失了，
+> 进程却会一直挂在那里（任务管理器里还能看到，还占着 CPU），要等哈希算完才
+> 真正退出。
+>
+> `run.py` 在启动前注册了一个退出钩子，让进程在主流程收尾（保存任务、暂停
+> 上传、停止服务）完成后直接结束，不再等待线程池里的长任务。实测同一场景：
+> `main.py` 要 11.3 秒才退出，`run.py` 只需 2.7 秒。
+>
+> 直接运行 `main.py` 也完全可用，只是可能遇到上面这个退出缓慢的问题。
 
 启动后：
 

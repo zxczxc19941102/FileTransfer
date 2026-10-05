@@ -94,7 +94,6 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
     本机上传任务列表（持久化 + 右键：继续执行 / 下载 / 暂停 / 删除），
     关闭时若有上传任务会两次确认。
     """
-    import json
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
 
@@ -102,15 +101,13 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
 
     from store import (human_size, list_active_uploads, local_machine_info,
                    read_all_meta, scan_pending_uploads)
-    from uploader import LOCAL_TASK_FILE, UploadTask, load_local_tasks, save_local_tasks
+    from uploader import UploadTask, load_local_tasks, save_local_tasks
 
     root = tk.Tk()
     root.title("局域网文件传输工具 - 电脑端")
     root.geometry("900x780")
     root.configure(bg="#0f1220")
     machine = local_machine_info()
-    # 上传任务的浏览器端 uid（用于把本机任务与网页"继续"联动）
-    WEB_UID = {}
 
     # ---------------------------------------------------------- 顶部信息
     tk.Label(root, text="局域网文件传输工具", bg="#0f1220", fg="#eef1ff",
@@ -177,7 +174,7 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
         if not iid:
             return
         tree.selection_set(iid)
-        menu = tk.Menu(root, tearless=0)
+        menu = tk.Menu(root, tearoff=0)
         menu.add_command(label="下载到本机",
                          command=lambda: webbrowser.open(f"http://127.0.0.1:{port}/files/{iid}"))
         menu.add_command(label="下载并选择保存位置",
@@ -260,19 +257,6 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
                   "done": "已完成", "failed": "失败", "canceled": "已取消",
                   "interrupted": "已中断"}
 
-    def task_state_text(t):
-        if t.status == "running":
-            return "上传中"
-        if t.status in ("paused",):
-            return "已暂停"
-        if t.status == "failed":
-            return "失败"
-        if t.status == "done":
-            return "已完成"
-        if t.status == "canceled":
-            return "已取消"
-        return "排队中"
-
     def pct_text(uploaded, size):
         """双精度百分比，保留两位小数。"""
         if not size:
@@ -341,7 +325,7 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
         rec = tasks.get(iid)
         if not rec:
             return
-        path, size, mtime = rec["path"], rec["task"].size, rec.get("mtime", 0)
+        path, size = rec["path"], rec["task"].size
         if not os.path.isfile(path):
             if not messagebox.askyesno(
                     "原文件不存在",
@@ -404,7 +388,7 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
         if not iid:
             return
         up_tree.selection_set(iid)
-        menu = tk.Menu(root, tearless=0)
+        menu = tk.Menu(root, tearoff=0)
         menu.add_command(label="继续执行", command=lambda: continue_task(iid))
         menu.add_command(label="下载", command=lambda: download_task(iid))
         menu.add_separator()

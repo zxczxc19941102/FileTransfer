@@ -1,0 +1,15 @@
+{
+  "// 说明": "本项目是无类型注解的实用脚本，关闭严格模式以消除大量无意义的告警",
+  "typeCheckingMode": "basic",
+  "reportMissingTypeStubs": false,
+  "reportUnknownParameterType": false,
+  "reportUnknownVariableType": false,
+  "reportUnknownMemberType": false,
+  "reportUnusedCallResult": false,
+  "reportMissingParameterType": false,
+  "reportImplicitStringConcatenation": false,
+  "reportConstantRedefinition": false,
+  "reportAttributeAccessIssue": "none",
+  "reportArgumentType": "none",
+  "reportCallIssue": "none"
+}

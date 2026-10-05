@@ -25,7 +25,7 @@ import qrcode
 import uvicorn
 
 from netutils import find_free_port, get_lan_ip, list_lan_ips
-from store import (UPLOAD_DIR, create_app, disk_free, human_size, read_all_meta)
+from store import UPLOAD_DIR, create_app, disk_free, human_size
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # 打包成 exe 后 __file__ 指向临时解压目录，必须改用 exe 所在目录

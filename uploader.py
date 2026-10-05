@@ -45,7 +45,14 @@ class UploadTask:
         return head
 
     def _meta_header(self) -> str:
-        return "filename " + base64.b64encode(self.name.encode("utf-8")).decode()
+        """Upload-Metadata：filename 与 filetype **都必须有值**。
+
+        tuspyserver 在 HEAD（断点续传第一步）时会校验这两个字段，
+        缺 filetype 会直接返回 400，导致续传退化成重新上传。
+        """
+        name_b64 = base64.b64encode(self.name.encode("utf-8")).decode()
+        type_b64 = base64.b64encode(b"application/octet-stream").decode()
+        return f"filename {name_b64},filetype {type_b64}"
 
     def _request(self, method: str, path: str, body=None, headers=None, timeout=60):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=timeout)
@@ -201,6 +208,23 @@ class UploadTask:
                             "Upload-Offset": str(self._offset),
                             "Content-Type": "application/offset+octet-stream",
                         }), timeout=300)
+                    if status == 404:
+                        # 服务端这个任务已被删除（过期清理或手动删除）：
+                        # 重建上传后从头传，而不是直接失败
+                        if getattr(self, "_recreated", False):
+                            raise RuntimeError("上传任务已在服务端被删除，请重新选择文件")
+                        self._recreated = True
+                        self.upload_url = ""
+                        self._path = ""
+                        self._offset = 0
+                        self.uploaded = 0
+                        self.speed = 0.0
+                        fp.seek(0)
+                        self._create_upload()
+                        self._offset = self._query_offset()
+                        last_bytes, last_time = self._offset, time.time()
+                        self._notify()
+                        continue
                     if status == 409:
                         # 偏移冲突（多任务/多窗口同时传同一个文件）：
                         # 重新查询服务端真实进度后接着传，而不是直接失败

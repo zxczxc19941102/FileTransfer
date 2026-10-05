@@ -20,6 +20,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -29,7 +30,7 @@ import uuid
 from datetime import datetime, timedelta
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from tuspyserver import create_tus_router
 from tuspyserver.router import TusRouterOptions
 
@@ -58,7 +59,7 @@ TUS_JS_PATH = os.path.join(RES_DIR, "tus.min.js")     # 内置的 tus-js-client
 # 4EB —— 等同"不设上限"，真正的限制是磁盘空间
 NO_SIZE_LIMIT = 1 << 62
 CHUNK_READ = 4 * 1024 * 1024        # 计算哈希时的读取块大小（4MB）
-EXPIRE_DAYS = 1                     # 未完成分片保留天数，超过自动清理
+EXPIRE_DAYS = 30                    # 未完成分片保留天数（大文件跨天传输常见，留足时间）
 MEMORY_PEAK = {"value": 0.0}         # 进程内存峰值（MB），由后台任务更新
 SERVER_IP = "127.0.0.1"             # 启动后写入真实内网 IP
 SERVER_PORT = 8000                  # 启动后写入真实端口
@@ -679,18 +680,49 @@ function setBtns(t, uploading){
   t.el.querySelector('[data-a="resume"]').hidden = uploading;
 }
 
-function startTask(t){
+async function startTask(t){
   if (t.upload) { t.upload.start(); setBtns(t, true); t.st.textContent = '上传中…'; return; }
   // 速度计算：每 0.3 秒采样一次并平滑，避免数字跳动
   t.lastTick = Date.now(); t.lastBytes = 0; t.speed = 0;
-  t.upload = new tus.Upload(t.file, {
+  // 先向服务端查有没有同名同大小的未完成任务：
+  // tus-js-client 自带的指纹存在浏览器里，清缓存/换浏览器就会失效，
+  // 这里按"文件名 + 大小"兜底，保证任何情况下都能从断点续传。
+  if (!t.resumeUrl) {
+    try {
+      const d = await (await fetch('/api/pending')).json();
+      const hit = (d.pending || []).find(p =>
+        p.name === t.file.name && p.size === t.file.size);
+      if (hit) {
+        t.resumeUrl = '/api/upload/' + hit.uid;
+        t.st.textContent = '检测到未完成任务，从断点续传…';
+      }
+    } catch (e) {}
+  }
+  const opts = {
     endpoint: '/api/upload/',
+    uploadUrl: t.resumeUrl || undefined,   // 指定则直接续传该任务
     chunkSize: 32 * 1024 * 1024,
     retryDelays: [0, 1000, 3000, 5000, 10000, 20000, 30000, 60000],
-    resumeFromPreviousUpload: true,        // 续传：先 HEAD 查已传字节
+    // 不用浏览器指纹（localStorage）：它指向的旧任务可能已被删除，
+    // 会导致 PATCH 404；续传统一以服务端 /api/pending 的结果为准
+    resumeFromPreviousUpload: false,
     removeFingerprintOnSuccess: true,
-    metadata: { filename: t.file.name, filetype: t.file.type || '' },
+    // filetype 必须有值：tuspyserver 在 HEAD（续传第一步）会校验，
+    // 空字符串会导致 400，续传退化成重新上传
+    metadata: { filename: t.file.name,
+                filetype: t.file.type || 'application/octet-stream' },
     onError(err){
+      const code = err && err.originalResponse ? err.originalResponse.getStatus() : 0;
+      if (code === 404 && !t.retried) {
+        // 服务端的这个任务已被删除（过期清理/手动删除）：
+        // 丢掉旧地址，重新建一个上传接着传
+        t.retried = true;
+        t.upload = null;
+        t.resumeUrl = null;
+        t.st.textContent = '原任务已失效，重新开始上传…';
+        startTask(t);
+        return;
+      }
       t.st.className = 'st err';
       t.st.textContent = '失败：' + (err && err.message ? err.message : '未知错误');
       setBtns(t, false);
@@ -716,7 +748,8 @@ function startTask(t){
       t.el.querySelector('[data-a="del"]').textContent = '清除';
       refresh(); refreshPending();
     }
-  });
+  };
+  t.upload = new tus.Upload(t.file, opts);
   t.upload.start();
   setBtns(t, true);
   t.st.textContent = '上传中…';

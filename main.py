@@ -21,11 +21,15 @@ import threading
 import time
 import webbrowser
 
-import qrcode
-import uvicorn
-
-from netutils import find_free_port, get_lan_ip, list_lan_ips
-from store import UPLOAD_DIR, create_app, disk_free, human_size
+# 依赖自举：必须在导入第三方库之前执行。用系统 Python / uv 托管的 Python
+# 直接运行本脚本时，会自动接入项目自带 .venv 中的依赖（见 runtime.py 说明）。
+import runtime
+runtime.ensure_runtime(__file__)
+import qrcode  # noqa: E402
+import uvicorn  # noqa: E402
+from netutils import find_free_port, get_lan_ip, list_lan_ips  # noqa: E402
+from store import (LOG_DIR, LOG_MAX_BYTES, LOG_PATH,  # noqa: E402
+                   UPLOAD_DIR, create_app, disk_free, human_size)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # 打包成 exe 后 __file__ 指向临时解压目录，必须改用 exe 所在目录
@@ -42,6 +46,60 @@ def ensure_std_streams():
     for name in ("stdout", "stderr"):
         if getattr(sys, name, None) is None:
             setattr(sys, name, open(os.devnull, "w", encoding="utf-8"))
+
+
+class _Tee:
+    """把输出同时送到原控制台流与日志文件。
+
+    只接管 write/flush，其余属性（reconfigure / fileno / isatty …）转发给
+    原流，避免破坏解释器或第三方库对 stdout 的既有假设。
+    """
+
+    def __init__(self, stream, log):
+        self._stream = stream
+        self._log = log
+
+    def write(self, text):
+        try:
+            self._stream.write(text)
+        except Exception:
+            pass
+        try:
+            self._log.write(text)
+        except Exception:
+            return 0
+        return len(text)
+
+    def flush(self):
+        for target in (self._stream, self._log):
+            try:
+                target.flush()
+            except Exception:
+                pass
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def setup_file_log() -> str:
+    """把 stdout/stderr 同时写入 logs/app.log，返回日志路径（失败返回空串）。
+
+    以 --noconsole 打包运行时没有控制台可看，出问题只能靠这份日志排查。
+    超过 LOG_MAX_BYTES 时轮转为 app.log.1，只保留一份历史，避免无限增长。
+    """
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        if os.path.isfile(LOG_PATH) and os.path.getsize(LOG_PATH) > LOG_MAX_BYTES:
+            os.replace(LOG_PATH, LOG_PATH + ".1")
+        # 行缓冲：日志要能实时查看，不能等缓冲区写满
+        log = open(LOG_PATH, "a", encoding="utf-8", errors="replace", buffering=1)
+    except OSError:
+        return ""
+    log.write(f"\n{'=' * 60}\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+              f"程序启动 pid={os.getpid()}\n{'=' * 60}\n")
+    sys.stdout = _Tee(sys.stdout, log)
+    sys.stderr = _Tee(sys.stderr, log)
+    return LOG_PATH
 
 
 def make_qrcode(text: str) -> str:
@@ -62,6 +120,33 @@ def print_qrcode_text(url: str):
         qr.print_ascii(invert=True)
     except UnicodeEncodeError:
         pass
+
+
+def sync_treeview(tree, rows) -> None:
+    """把 Treeview 内容增量同步为 rows（[(iid, values), ...]），保持顺序与选中状态。
+
+    为什么不能用「先 delete 全部再 insert」
+    --------------------------------------
+    本窗口每 2 秒刷新一次列表。若每次把行删光重建，用户刚选中的行会被销毁、
+    重建后不再处于选中态，表现为"选中后一两秒就自动失去高亮"，右键也因此
+    经常点不到目标行。
+
+    这里改为按 iid 做差分：消失的行才删除、已有的行只改数值、顺序用 move
+    校正，选中状态与滚动位置都不会被打断。
+    """
+    wanted = {iid for iid, _ in rows}
+    for iid in tree.get_children():
+        if iid not in wanted:
+            tree.delete(iid)                 # 任务已结束 / 记录已删除，才移除该行
+    for index, (iid, values) in enumerate(rows):
+        values = tuple(str(v) for v in values)
+        if tree.exists(iid):
+            if tuple(tree.item(iid, "values")) != values:
+                tree.item(iid, values=values)
+            if tree.index(iid) != index:
+                tree.move(iid, "", index)
+        else:
+            tree.insert("", index, iid=iid, values=values)
 
 
 def start_server(host: str, port: int):
@@ -99,13 +184,14 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
 
     from PIL import Image, ImageTk
 
-    from store import (BASE_DIR, human_size, list_active_uploads, local_machine_info,
+    from store import (LOG_DIR, PARALLEL_LIMIT_MAX, SETTINGS_PATH, UPLOAD_DIR,
+                       human_size, list_active_uploads, local_machine_info,
                        meta_path, read_all_meta, scan_pending_uploads)
     from uploader import UploadTask, load_local_tasks, save_local_tasks
 
     root = tk.Tk()
     root.title("局域网文件传输工具 - 电脑端")
-    root.geometry("900x780")
+    root.geometry("900x860")
     root.configure(bg="#0f1220")
     machine = local_machine_info()
 
@@ -125,14 +211,16 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
     tk.Label(root, image=photo, bg="white", bd=0).pack(pady=2)
 
     # ---------------------------------------------------------- 已接收文件
-    tk.Label(root, text="已接收文件（其他设备上传时这里会实时显示进度；左键选中，右键：下载 / 删除）",
+    tk.Label(root, text="已接收文件（Ctrl / Shift 可多选，按 Delete 删除记录；右键：下载 / 删除）",
              bg="#0f1220", fg="#eef1ff",
              font=("微软雅黑", 10, "bold")).pack(anchor="w", padx=14, pady=(6, 2))
 
     frame = tk.Frame(root, bg="#0f1220")
     frame.pack(fill="both", expand=True, padx=14)
     cols = ("name", "size", "state", "time", "ip", "pcname", "mac")
-    tree = ttk.Treeview(frame, columns=cols, show="headings", height=8)
+    # selectmode="extended"：支持 Ctrl / Shift 多选，配合 Delete 键批量删记录
+    tree = ttk.Treeview(frame, columns=cols, show="headings", height=8,
+                        selectmode="extended")
     headers = (("文件名", 175), ("大小", 80), ("状态", 105), ("接收时间", 100),
                ("IP地址", 100), ("计算机名", 100), ("MAC地址", 120))
     for col, (title, width) in zip(cols, headers):
@@ -206,8 +294,13 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
         return (info.get("client_ip") or "").strip() in self_ips
 
     def refresh_tree():
-        for item in tree.get_children():
-            tree.delete(item)
+        """刷新「已接收文件」列表（增量同步，不打断用户选中状态）。
+
+        注意必须走 sync_treeview 增量更新：本函数由 tick() 每 2 秒调用一次，
+        若每次把行删光重建，用户选中的行会被销毁，表现为"选中后一两秒
+        自动失去高亮"。
+        """
+        rows = []
         # 其他设备正在上传的任务：显示实时进度（其它设备/网页端上传时同步可见）
         try:
             for a in list_active_uploads():
@@ -216,33 +309,40 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
                 uid = a["uid"]
                 live_info[uid] = a
                 mine = is_mine(uid)
-                tree.insert("", "end", iid="live_" + uid, values=(
-                    a["name"], human_size(a["size"], ), f"上传中 {pct:.2f}%",
+                rows.append(("live_" + uid, (
+                    a["name"], human_size(a["size"]), f"上传中 {pct:.2f}%",
                     ("本机上传" if mine else "传输中…"),
-                    a.get("client_ip") or "-", who, a.get("client_mac") or "-"))
+                    a.get("client_ip") or "-", who, a.get("client_mac") or "-")))
         except Exception as exc:
             report_gui_error(f"刷新传输中列表失败：{exc}")
         for rec in read_all_meta():
-            tree.insert("", "end", iid=rec["id"], values=(
+            rows.append((rec["id"], (
                 rec["name"], human_size(rec["size"]), "已完成", rec["uploaded_at"],
                 rec.get("client_ip") or "-", rec.get("client_name") or "-",
-                rec.get("client_mac") or "-"))
+                rec.get("client_mac") or "-")))
+        sync_treeview(tree, rows)
 
-    def api_call(method: str, path: str):
+    def api_call(method: str, path: str, payload=None):
         """调用本机服务接口。
 
         请求走 127.0.0.1，因此在服务端看来属于"本机"，对本机发起的
         任务拥有操作权限；他人的任务会被 403 拒绝。
+        payload 非空时以 JSON 形式发送（用于写设置等接口）。
         """
         import http.client
         import json as _json
         try:
+            body = None
+            headers = {}
+            if payload is not None:
+                body = _json.dumps(payload).encode("utf-8")
+                headers["Content-Type"] = "application/json"
             conn = http.client.HTTPConnection("127.0.0.1", port, timeout=20)
-            conn.request(method, path)
+            conn.request(method, path, body=body, headers=headers)
             resp = conn.getresponse()
-            body = resp.read()
+            raw = resp.read()
             conn.close()
-            data = _json.loads(body.decode("utf-8")) if body else {}
+            data = _json.loads(raw.decode("utf-8")) if raw else {}
             if resp.status >= 400:
                 return False, data.get("detail", f"HTTP {resp.status}")
             return True, data
@@ -313,7 +413,10 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
         iid = tree.identify_row(event.y)
         if not iid:
             return
-        tree.selection_set(iid)
+        # 右键落在已选中的行上时保留现有多选，否则才把选中项改成该行；
+        # 无脑 selection_set 会把用户刚做的多选清成一个。
+        if iid not in tree.selection():
+            tree.selection_set(iid)
         menu = tk.Menu(root, tearoff=0)
         if iid.startswith("live_"):
             uid = iid[5:]
@@ -340,7 +443,8 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
         menu.add_command(label="打开所在文件夹",
                          command=lambda: reveal_path(rec_path(iid)))
         menu.add_separator()
-        menu.add_command(label="删除任务（保留文件）", command=lambda: delete_record(iid))
+        # 与 Delete 键共用同一个入口：都是对「当前选中项」批量删记录
+        menu.add_command(label="删除记录（保留文件）", command=delete_selected_records)
         popup_menu(menu, event.x_root, event.y_root)
 
     def save_as(file_id: str):
@@ -375,39 +479,92 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
             (os.startfile(path) if os.name == "nt"
              else subprocess.Popen(["xdg-open", path]))
 
-    def reveal_path(path: str):
-        if path and os.path.isfile(path):
-            folder = os.path.dirname(path)
-            if os.name == "nt":
-                subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
-            else:
-                subprocess.Popen(["xdg-open", folder])
+    def open_folder(path: str, select: str = ""):
+        """在系统文件管理器中打开目录；select 有值且该文件存在时顺便选中它。
 
-    def delete_record(file_id: str):
-        rec = next((r for r in read_all_meta() if r["id"] == file_id), None)
-        if not rec:
-            return
-        if not messagebox.askyesno("删除任务",
-                                   f"仅删除任务记录，不删除文件：\n{rec['name']}\n\n确定删除吗？"):
+        目录不存在会先创建：用户点「日志目录」时可能还没有生成任何日志。
+        """
+        if not path:
             return
         try:
-            # 直接用元数据模块的路径函数，避免手工按层数剥离目录出错
-            # （原先多剥了一层 dirname，拼出的是 f:\meta\xxx.json）
-            os.remove(meta_path(file_id))
-        except FileNotFoundError:
-            pass  # 记录已不存在，等同于删除成功
-        except OSError as exc:
-            messagebox.showerror("删除失败", str(exc))
-            return
-        refresh_tree()
+            os.makedirs(path, exist_ok=True)
+        except OSError:
+            pass
+        if os.name != "nt":
+            subprocess.Popen(["xdg-open", path])
+        elif select and os.path.isfile(select):
+            subprocess.Popen(["explorer", "/select,", os.path.normpath(select)])
+        else:
+            os.startfile(path)
 
-    # 单击仅选中高亮；双击不做任何动作
+    def reveal_path(path: str):
+        """在资源管理器中定位并选中该文件。"""
+        if path and os.path.isfile(path):
+            open_folder(os.path.dirname(path), path)
+
+    def delete_selected_records():
+        """批量删除选中的下载记录（只删记录，保留 uploads 里的文件）。
+
+        入口有两个：列表里按 Delete 键，或右键菜单「删除记录（保留文件）」。
+        两者共用本函数，行为完全一致。
+
+        传输中的任务（live_ 前缀）不在这里处理：它要么属于本机上传器、
+        要么属于其它设备，删掉记录没有意义，请走右键的「删除任务」。
+        记录文件缺失（.meta 里已不存在）同样视为删除成功，保证幂等。
+        """
+        meta = {r["id"]: r for r in read_all_meta()}
+        ids = [iid for iid in tree.selection()
+               if not iid.startswith("live_") and iid in meta]
+        if not ids:
+            return
+        names = [meta[iid]["name"] for iid in ids]
+        preview = "、".join(names[:5]) + ("…" if len(names) > 5 else "")
+        if not messagebox.askyesno(
+                "删除记录",
+                f"仅删除 {len(ids)} 条任务记录，不删除文件：\n{preview}\n\n确定删除吗？"):
+            return
+        failed = []
+        for iid in ids:
+            try:
+                os.remove(meta_path(iid))
+            except FileNotFoundError:
+                pass                    # 记录已不存在，等同于删除成功
+            except OSError as exc:
+                failed.append(f"{meta[iid]['name']}：{exc}")
+        refresh_tree()
+        if failed:
+            messagebox.showerror("部分删除失败", "\n".join(failed[:5]))
+
+    # 单击仅选中高亮；双击不做任何动作；Delete 批量删除选中的记录
     tree.bind("<Button-3>", on_rec_right_click)
     tree.bind("<Button-2>", on_rec_right_click)
+    tree.bind("<Delete>", lambda _event: delete_selected_records())
     # ---------------------------------------------------------- 本机上传任务
-    tk.Label(root, text="从本机上传（分片 · 断点续传 · 可暂停继续；右键：继续 / 下载 / 暂停 / 删除）",
+    # 并行任务数：默认 32（服务端硬上限），改动后写回服务端，网页端 2 秒内同步
+    ok, cfg = api_call("GET", "/api/settings")
+    parallel_max = PARALLEL_LIMIT_MAX
+    parallel = {"value": 0}
+    if ok and isinstance(cfg, dict):
+        parallel_max = int(cfg.get("limit") or PARALLEL_LIMIT_MAX)
+        parallel["value"] = int(cfg.get("max_parallel") or 0)
+    if not 1 <= parallel["value"] <= parallel_max:
+        parallel["value"] = parallel_max
+
+    up_head = tk.Frame(root, bg="#0f1220")
+    up_head.pack(fill="x", padx=14, pady=(8, 2))
+    tk.Label(up_head, text="从本机上传（分片 · 断点续传 · 可暂停继续；右键：继续 / 下载 / 暂停 / 删除）",
              bg="#0f1220", fg="#eef1ff",
-             font=("微软雅黑", 10, "bold")).pack(anchor="w", padx=14, pady=(8, 2))
+             font=("微软雅黑", 10, "bold")).pack(side="left")
+    par_box = tk.Frame(up_head, bg="#0f1220")
+    par_box.pack(side="right")
+    tk.Label(par_box, text="并行任务数", bg="#0f1220", fg="#9aa3c7",
+             font=("微软雅黑", 9)).pack(side="left")
+    parallel_box = ttk.Combobox(par_box, width=4, state="readonly",
+                                justify="center",
+                                values=[str(n) for n in range(1, parallel_max + 1)])
+    parallel_box.set(str(parallel["value"]))
+    parallel_box.pack(side="left", padx=(6, 0))
+    parallel_box.bind("<<ComboboxSelected>>", lambda _e: on_parallel_change())
 
     up_frame = ttk.Frame(root)
     up_frame.pack(fill="x", padx=14)
@@ -454,6 +611,59 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
         else:
             up_tree.insert("", "end", iid=iid, values=row_values(rec))
 
+    # ---------------------------------------------------------- 并行任务调度
+    # 本机上传同样受并行上限约束：超出名额的任务显示「排队中」，
+    # 有任务完成 / 暂停 / 删除时自动顶上。数值由上面的下拉框控制，
+    # 并写回服务端供网页端同步（见 on_parallel_change）。
+    def running_tasks() -> int:
+        return sum(1 for r in tasks.values() if r.get("state") == "running")
+
+    def pump_local():
+        """按当前上限启动排队中的本机上传任务，先到先传。"""
+        for iid, rec in list(tasks.items()):
+            if running_tasks() >= parallel["value"]:
+                break
+            if rec.get("state") != "waiting":
+                continue
+            rec["state"] = "running"
+            rec["task"].start()
+            _update_row(iid, rec["task"].uploaded, rec["task"].size, 0, "running")
+
+    def apply_parallel_limit():
+        """上限调小：列表靠前的任务保留上传，超出的转回「排队中」。"""
+        kept = 0
+        for iid, rec in list(tasks.items()):
+            state = rec.get("state")
+            if state in ("done", "canceled", "failed"):
+                continue
+            kept += 1
+            if kept > parallel["value"] and state == "running":
+                rec["task"].pause()
+                rec["state"] = "waiting"
+                _update_row(iid, rec["task"].uploaded,
+                            rec["task"].size, 0, "waiting")
+        pump_local()
+
+    def on_parallel_change():
+        """下拉框改动：写回服务端（网页端会自动同步），并重排本机队列。
+
+        数值没真正变化时直接返回：避免任何杂散的 <<ComboboxSelected>>
+        事件把设置重新写一遍（导致用户看到的数字与实际不符，或产生多余磁盘写）。
+        """
+        try:
+            value = int(parallel_box.get())
+        except ValueError:
+            return
+        value = max(1, min(parallel_max, value))
+        if value == parallel["value"]:
+            return
+        parallel["value"] = value
+        ok, msg = api_call("POST", "/api/settings",
+                           {"max_parallel": parallel["value"]})
+        apply_parallel_limit()
+        status_var.set(f"并行任务数已设为 {parallel['value']}，网页端会自动同步"
+                       if ok else f"⚠ 并行任务数未能同步到服务端：{msg}")
+
     def add_task(path: str, state: str = "waiting", uploaded: int = 0, iid: str = ""):
         """新建（或恢复）一个本机上传任务；传入 iid 表示复用原行，不新增条目。"""
         task = UploadTask(path, port)
@@ -470,7 +680,9 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
             root.after(0, lambda: persist_tasks())
 
         task.on_progress = on_progress
-        task.on_done = lambda t: root.after(0, refresh_tree)
+        # 任务结束后让出名额，排队的任务顶上
+        task.on_done = lambda t: (root.after(0, refresh_tree),
+                                  root.after(0, pump_local))
         upsert_row(iid, {"name": task.name, "size": task.size,
                          "pct": pct_text(uploaded, task.size),
                          "speed": "-", "state": norm_state(state)})
@@ -493,6 +705,9 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
             rec["error_shown"] = True
             messagebox.showerror("上传失败",
                                  f"{rec['task'].name}\n\n{rec['task'].error or '未知错误'}")
+        # 任务一旦不再占用名额（完成 / 失败 / 暂停 / 取消），让排队的任务顶上
+        if status != "running":
+            root.after(0, pump_local)
 
     def persist_tasks():
         """把本机上传任务持久化，重启程序后仍可续传（状态存英文枚举）。"""
@@ -533,7 +748,8 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
             if task.status == "running":
                 task.pause()
             tasks.pop(iid, None)
-            add_task(picked, state="waiting", uploaded=0, iid=iid).start()
+            add_task(picked, state="waiting", uploaded=0, iid=iid)
+            pump_local()
             return
         st = os.stat(path)
         if task.size and st.st_size != task.size:
@@ -544,7 +760,8 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
             if task.status == "running":
                 task.pause()
             tasks.pop(iid, None)
-            add_task(path, state="waiting", uploaded=0, iid=iid).start()
+            add_task(path, state="waiting", uploaded=0, iid=iid)
+            pump_local()
             return
         if rec.get("mtime") and abs(st.st_mtime - rec["mtime"]) > 1:
             if not messagebox.askyesno(
@@ -552,10 +769,11 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
                     "文件修改时间与记录不一致，可能不是同一个文件。\n\n"
                     "仍要从断点继续上传吗？"):
                 return
-        if task.status == "running":
+        if rec.get("state") == "running":
             return                      # 本来就在传，避免重复启动
-        task.start()
-        _update_row(iid, task.uploaded, task.size, 0, "running")
+        rec["state"] = "waiting"
+        _update_row(iid, task.uploaded, task.size, 0, "waiting")
+        pump_local()                    # 有名额立刻开始，否则排队等下一位
 
     def download_task(iid: str):
         """下载任务：已完成则下载成品，未完成则提示可下载已接收分片。"""
@@ -593,6 +811,7 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
         if up_tree.exists(iid):
             up_tree.delete(iid)
         persist_tasks()
+        pump_local()                    # 名额空出来，让排队的任务顶上
 
     def on_up_right_click(event):
         iid = up_tree.identify_row(event.y)
@@ -614,7 +833,10 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
     for item in load_local_tasks():
         path = item.get("path", "")
         if path and os.path.isfile(path):
-            add_task(path, state=item.get("state", "paused"),
+            # 上次退出时还在上传的任务，恢复后一律停在「已暂停」，
+            # 由用户点「继续」重新入队，避免程序一启动就偷偷跑满带宽
+            state = norm_state(item.get("state"), "paused")
+            add_task(path, state="paused" if state == "running" else state,
                      uploaded=item.get("uploaded", 0))
         elif path:
             upsert_row(item.get("iid", path), {
@@ -625,14 +847,18 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
 
     def pick_files():
         for path in filedialog.askopenfilenames(title="选择要上传的文件"):
-            add_task(path).start()
+            add_task(path)
+        pump_local()          # 按并行上限放行，超出的显示「排队中」
 
     def start_selected():
+        """「开始/继续」：选中项回到队列，由调度器按名额启动。"""
         for iid in up_tree.selection():
-            if iid in tasks:
-                tasks[iid]["task"].start()
-                _update_row(iid, tasks[iid]["task"].uploaded,
-                            tasks[iid]["task"].size, 0, "running")
+            rec = tasks.get(iid)
+            if rec and rec.get("state") != "running":
+                rec["state"] = "waiting"
+                _update_row(iid, rec["task"].uploaded,
+                            rec["task"].size, 0, "waiting")
+        pump_local()
 
     def pause_selected():
         for iid in up_tree.selection():
@@ -642,11 +868,13 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
         for iid in up_tree.selection():
             delete_task(iid)
     # ---------------------------------------------------------- 未完成任务提示
-    pending = scan_pending_uploads()
+    # include_active=True：正在传输中的任务也要列出来，否则只查"已停止"的
+    # 那些，会出现任务在两个列表里都查不到的错觉
+    pending = scan_pending_uploads(include_active=True)
     if pending:
-        text = "上次有未完成的上传（网页端可继续）：" + "、".join(
-            f"{p['name']} {pct_text(p['offset'], p['size'])}" for p in pending[:3])
-        tk.Label(root, text=text + ("…" if len(pending) > 3 else ""),
+        names = "、".join(f"{p['name']} {pct_text(p['offset'], p['size'])}"
+                          for p in pending)
+        tk.Label(root, text=f"共 {len(pending)} 个未完成的上传（网页端或本机可继续）：{names}",
                  bg="#3a2f14", fg="#ffcc66", font=("微软雅黑", 9),
                  wraplength=850, justify="left").pack(fill="x", padx=14, pady=(6, 0))
 
@@ -659,14 +887,28 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
     def open_upload_dir():
         """打开接收目录。
 
-        必须用 store.BASE_DIR：打包成 exe 后 __file__ 指向 PyInstaller 的
+        必须用 store.UPLOAD_DIR：打包成 exe 后 __file__ 指向 PyInstaller 的
         临时解压目录，会打开一个不存在的位置。
         """
-        folder = os.path.join(BASE_DIR, "uploads")
-        if os.name == "nt":
-            os.startfile(folder)
-        else:
-            subprocess.Popen(["xdg-open", folder])
+        open_folder(UPLOAD_DIR)
+
+    # ---------------------------------------------------------- 目录链接
+    # 直接显示真实路径并可点击打开；配置文件（.settings.json）与接收到的
+    # 文件同在接收目录，点「配置文件」会在资源管理器中选中它。
+    tk.Label(root, text="目录（点击即可打开）", bg="#0f1220", fg="#9aa3c7",
+             font=("微软雅黑", 9)).pack(anchor="w", padx=14, pady=(4, 0))
+    dirs_row = tk.Frame(root, bg="#0f1220")
+    dirs_row.pack(fill="x", padx=14)
+    for caption, shown, folder, select in (
+            ("接收 / 配置目录", UPLOAD_DIR, UPLOAD_DIR, ""),
+            ("配置文件", SETTINGS_PATH, UPLOAD_DIR, SETTINGS_PATH),
+            ("日志", LOG_PATH, LOG_DIR, "")):
+        link = tk.Label(dirs_row, text=f"{caption}：{shown}", bg="#0f1220",
+                        fg="#8fb0ff", font=("微软雅黑", 9, "underline"),
+                        cursor="hand2", anchor="w")
+        link.pack(anchor="w")
+        link.bind("<Button-1>",
+                  lambda _e, f=folder, s=select: open_folder(f, s))
 
     bar = tk.Frame(root, bg="#0f1220")
     bar.pack(pady=8)
@@ -724,6 +966,8 @@ def main() -> None:
             stream.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass
+    # 之后所有 print 都会同时落到 logs/app.log，便于无控制台时排查
+    log_path = setup_file_log()
 
     parser = argparse.ArgumentParser(description="局域网文件传输工具（TUS 分片上传）")
     parser.add_argument("--host", default="0.0.0.0", help="监听地址，默认 0.0.0.0（所有网卡）")
@@ -745,6 +989,7 @@ def main() -> None:
     print("=" * 60)
     print(f"  访问地址   : {url}")
     print(f"  接收目录   : {UPLOAD_DIR}")
+    print(f"  日志文件   : {log_path or '（写入失败，日志不可用）'}")
     print(f"  剩余磁盘   : {human_size(disk_free(UPLOAD_DIR))}")
     others = [ip for ip in list_lan_ips() if ip != SERVER_IP]
     if others:

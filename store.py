@@ -35,7 +35,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from tuspyserver import create_tus_router
 from tuspyserver.router import TusRouterOptions
 
-from netutils import get_lan_ip
+from netutils import get_lan_ip, run_text
 
 # ==========================================================================
 # 一、路径与全局参数
@@ -56,6 +56,18 @@ UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")        # 完成的文件
 META_DIR = os.path.join(UPLOAD_DIR, ".meta")          # 元数据
 TUS_DIR = os.path.join(UPLOAD_DIR, ".tus")            # 上传中的临时分片
 TUS_JS_PATH = os.path.join(RES_DIR, "tus.min.js")     # 内置的 tus-js-client
+LOG_DIR = os.path.join(BASE_DIR, "logs")              # 运行日志
+LOG_PATH = os.path.join(LOG_DIR, "app.log")
+LOG_MAX_BYTES = 4 * 1024 * 1024                       # 超过即轮转为 app.log.1
+
+# 允许「在电脑上打开」的目录白名单：接口只认这几个 key，
+# 不做任意路径透传，避免变成局域网内可远程打开任意位置的后门。
+OPENABLE_DIRS = {
+    "upload": UPLOAD_DIR,      # 接收到的文件
+    "config": UPLOAD_DIR,      # 配置文件与接收文件同目录
+    "log": LOG_DIR,
+    "base": BASE_DIR,
+}
 
 # 4EB —— 等同"不设上限"，真正的限制是磁盘空间
 NO_SIZE_LIMIT = 1 << 62
@@ -66,6 +78,14 @@ PURGE_INTERVAL = 5                  # 已删除任务的残留分片复查间隔
 MEMORY_PEAK = {"value": 0.0}         # 进程内存峰值（MB），由后台任务更新
 SERVER_IP = "127.0.0.1"             # 启动后写入真实内网 IP
 SERVER_PORT = 8000                  # 启动后写入真实端口
+
+# ---- 并行任务数（同时进行的上传任务上限）----
+# 程序端下拉框与网页端排队逻辑共用这一个值，网页端每 2 秒轮询 /api/settings 同步。
+# 默认与硬上限都是 32；超过上限的任务进入「排队中」，有名额后自动开始。
+PARALLEL_LIMIT_MAX = 32             # 硬上限，无法通过接口突破
+PARALLEL_LIMIT_DEFAULT = 32         # 默认值
+PARALLEL = {"value": PARALLEL_LIMIT_DEFAULT}
+SETTINGS_PATH = os.path.join(UPLOAD_DIR, ".settings.json")
 
 # 当前请求的客户端 IP（由 HTTP 中间件在进入业务处理前写入）。
 # 0 字节文件、或长度极小在 POST 请求内就完成的 TUS 上传，其完成回调
@@ -94,8 +114,49 @@ def quiet_loop_exception_handler(loop, context: dict):
 
 def ensure_dirs():
     """创建全部工作目录（不存在则自动创建）。"""
-    for path in (UPLOAD_DIR, META_DIR, TUS_DIR):
+    for path in (UPLOAD_DIR, META_DIR, TUS_DIR, LOG_DIR):
         os.makedirs(path, exist_ok=True)
+
+
+def open_local_dir(path: str) -> bool:
+    """在系统文件管理器中打开目录，返回是否成功。
+
+    目录不存在时先建出来，避免用户点「日志」时因为还没有日志而报错。
+    path 只能来自 OPENABLE_DIRS 白名单，不接受外部传入的任意路径。
+    """
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError:
+        return False
+    try:
+        if os.name == "nt":
+            os.startfile(path)
+        else:
+            subprocess.Popen(["xdg-open", path])
+        return True
+    except OSError:
+        return False
+
+
+def load_settings():
+    """读取持久化的设置（当前只有并行任务上限），异常时保留默认值。"""
+    try:
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as fp:
+            value = int(json.load(fp).get("max_parallel"))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return
+    PARALLEL["value"] = max(1, min(PARALLEL_LIMIT_MAX, value))
+
+
+def save_settings():
+    """原子写出设置，避免写入中断把配置弄坏。"""
+    tmp = SETTINGS_PATH + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fp:
+            json.dump({"max_parallel": PARALLEL["value"]}, fp)
+        os.replace(tmp, SETTINGS_PATH)
+    except OSError:
+        pass
 
 
 def build_streaming_storage():
@@ -261,9 +322,7 @@ def _mac_of(ip: str) -> str:
     """从邻居表（ARP/NDP）反查 MAC 地址，查不到返回空字符串。"""
     if os.name == "nt":
         try:
-            out = subprocess.run(["arp", "-a", ip], capture_output=True,
-                                 text=True, timeout=3,
-                                 creationflags=0x08000000).stdout
+            out = run_text(["arp", "-a", ip], timeout=3)
             # 形如：  192.168.1.100           0a-bc-1d-2e-3f-4a     dynamic
             for line in out.splitlines():
                 if ip in line:
@@ -295,9 +354,7 @@ def _name_of(ip: str) -> str:
         pass
     if os.name == "nt":
         try:
-            out = subprocess.run(["nbtstat", "-A", ip], capture_output=True,
-                                 text=True, timeout=3,
-                                 creationflags=0x08000000).stdout
+            out = run_text(["nbtstat", "-A", ip], timeout=3)
             for line in out.splitlines():
                 if line.startswith(ip) or "<00>" in line:
                     cols = line.split()
@@ -627,7 +684,9 @@ def read_all_meta() -> list:
                 items.append(item)
         except (OSError, ValueError):
             continue
-    items.sort(key=lambda x: x.get("finished_at") or "", reverse=True)
+    # 按接收时间倒序。write_meta 写入的字段是 uploaded_at，
+    # 原先这里取 finished_at（从未写入过）导致排序恒定失效、列表顺序随机。
+    items.sort(key=lambda x: x.get("uploaded_at") or "", reverse=True)
     return items
 
 
@@ -860,12 +919,20 @@ button.mini{background:#262c4a;border:1px solid #363d61;color:#cfd6f5;border-rad
   padding:3px 12px;font-size:12.5px;cursor:pointer}
 button.mini:hover{background:#313a5c}
 button.mini[data-a="del"]{color:#ffb3bd;border-color:#5a3440}
+/* 折叠角标：任务超过 2 个时出现，点击折叠/展开该任务卡片 */
+.tg{flex:none;cursor:pointer;color:#98a1c4;font-size:12px;line-height:1;
+  padding:2px 7px;border-radius:6px;background:#262c4a;border:1px solid #363d61;
+  user-select:none}
+.tg:hover{background:#313a5c;color:#eef1ff}
+.row.collapsed .sz,.row.collapsed .bar,.row.collapsed .st,.row.collapsed .ops{display:none}
+.row.collapsed .nm{font-size:13px}
 </style>
 </head>
 <body>
 <div class="wrap">
   <h1>局域网文件传输</h1>
   <p class="sub" id="info">正在连接…</p>
+  <p class="sz" id="paths" style="margin:-8px 0 12px"></p>
 
   <div class="card" id="remoteCard" hidden>
     <b>其他设备正在上传</b>
@@ -884,7 +951,7 @@ button.mini[data-a="del"]{color:#ffb3bd;border-color:#5a3440}
   </div>
 
   <div class="card" id="pendingCard" hidden>
-    <b>未完成的任务（程序异常关闭后保留，默认暂停）</b>
+    <b id="pendingTitle">未完成的任务</b>
     <div class="sz" style="margin:4px 0 8px" id="pendingTip"></div>
     <div id="pending"></div>
   </div>
@@ -958,6 +1025,65 @@ const STATE_TEXT = {
 const TASKS = [];   // {file, upload, el, status, uid}
 let pendingResume = null;   // 点「继续」后待绑定的未完成任务
 
+/* ---------------- 并行任务上限（与程序端下拉框同步） ----------------
+   程序端改数字 -> POST /api/settings -> 本页轮询到新值后重排名额：
+   列表靠前的任务保持传输，多出来的转「排队中」，腾出名额再自动续传。 */
+const WAIT_TEXT = '排队中（等待空闲名额）';
+let maxParallel = 32;        // 当前并行上限
+let parallelLimitMax = 32;   // 服务端硬上限
+let maxParallelReady = false;
+
+function runningCount(){
+  return TASKS.filter(t => t.status === STATE.UPLOADING).length;
+}
+function queuedCount(){
+  return TASKS.filter(t => t.status === STATE.WAITING).length;
+}
+
+/* 调度器：按列表顺序补足名额，先到先传 */
+function pump(){
+  for (const t of TASKS) {
+    if (runningCount() >= maxParallel) break;
+    if (t.status === STATE.WAITING) startTask(t);
+  }
+  syncCards();
+}
+
+/* 让出一个名额：中止当前分片但保留服务端进度，状态转为「排队中」 */
+function queueTask(t){
+  try { if (t.upload) t.upload.abort(); } catch (e) {}
+  stopBeat(t);
+  t.status = STATE.WAITING;
+  if (t.st) t.st.textContent = WAIT_TEXT;
+  renderTask(t);
+}
+
+/* 上限变小：靠前的 maxParallel 个保持传输，其余转「排队中」 */
+function applyParallelLimit(){
+  let kept = 0;
+  for (const t of TASKS) {
+    if (t.status !== STATE.UPLOADING && t.status !== STATE.WAITING) continue;
+    kept++;
+    if (kept > maxParallel && t.status === STATE.UPLOADING) queueTask(t);
+  }
+  pump();
+}
+
+async function syncSettings(){
+  let d;
+  try { d = await (await fetch('/api/settings')).json(); } catch (e) { return; }
+  const value = Number(d && d.max_parallel) || 32;
+  parallelLimitMax = Number(d && d.limit) || 32;
+  if (value === maxParallel) { maxParallelReady = true; syncCards(); return; }
+  const changed = maxParallelReady;   // 首次同步不算「被程序端改动」，不弹提示
+  maxParallel = value;
+  maxParallelReady = true;
+  if (changed) {
+    applyParallelLimit();
+    toast('并行任务数已同步为 ' + value);
+  }
+}
+
 /* 记住"本标签页发起过的上传 ID"。
    刷新页面后 TASKS 会清空，若只靠它判断，自己正在传的任务会被
    「其他设备正在上传」误报成别人的。用 sessionStorage 持久化，
@@ -1013,6 +1139,7 @@ function applyRemotePause(uid){
   renderTask(t);
   toast('已在电脑端暂停该上传');
   refreshPending();
+  pump();                        // 名额空出来，让排队的任务顶上
 }
 
 /* 服务端已删除该任务：停止一切重试（不再自动重建） */
@@ -1025,6 +1152,7 @@ function applyRemoteDelete(uid){
   t.st.textContent = '任务已被删除';
   renderTask(t);
   toast('该上传任务已被删除');
+  pump();                        // 名额空出来，让排队的任务顶上
 }
 /* 每个任务各自维护心跳（支持多任务并行上传）；
    uid 在 POST 创建成功后才由 tus-js-client 写入 url，因此这里每轮重新解析。*/
@@ -1060,10 +1188,11 @@ function taskRow(t){
   el.className = 'row';
   el.innerHTML =
     '<div class="hd"><span class="nm">' + esc(t.file.name) + '</span>'
-    + '<span class="pct">0.00%</span></div>'
+    + '<span class="pct">0.00%</span>'
+    + '<span class="tg" hidden>&#9662;</span></div>'
     + '<div class="sz">' + fmt(t.file.size) + '</div>'
     + '<div class="bar"><i></i></div>'
-    + '<div class="st">排队中…</div>'
+    + '<div class="st">' + WAIT_TEXT + '</div>'
     + '<div class="ops">'
     + '<button class="mini" data-a="pause">暂停</button>'
     + '<button class="mini" data-a="resume" hidden>继续</button>'
@@ -1079,7 +1208,26 @@ function taskRow(t){
     else if (act === 'resume') startTask(t);
     else if (act === 'del') deleteTask(t);
   });
+  // 折叠角标：任务较多时可把卡片收成一行，避免撑爆屏幕
+  el.querySelector('.tg').addEventListener('click', ev => {
+    ev.target.textContent = el.classList.toggle('collapsed') ? '\u25b8' : '\u25be';
+  });
   return el;
+}
+
+/* 折叠角标：任务超过 2 个时才出现；回到 2 个以内则全部展开 */
+function syncCards(){
+  const cards = TASKS.map(t => t.el).filter(Boolean);
+  const many = cards.length > 2;
+  cards.forEach(el => {
+    const tg = el.querySelector('.tg');
+    if (!tg) return;
+    tg.hidden = !many;
+    if (!many && el.classList.contains('collapsed')) {
+      el.classList.remove('collapsed');
+      tg.textContent = '\u25be';
+    }
+  });
 }
 
 /* 依据状态统一渲染：只有 uploading/waiting 允许显示暂停按钮 */
@@ -1092,24 +1240,28 @@ function renderTask(t){
 }
 
 async function startTask(t){
-  if (t.upload) {
+  if (t.upload) {                     // 已创建过上传对象：直接续传
     t.status = STATE.UPLOADING;
-    t.upload.start();
     renderTask(t);
+    t.upload.start();
     startBeat(t);
     refreshPending();      // 立即刷新：恢复上传后该任务不应再出现在"未完成"
     return;
   }
-  t.status = STATE.WAITING;
+  if (t.creating) return;             // 正在创建中：避免调度器重复触发
+  t.creating = true;
+  t.status = STATE.UPLOADING;         // 先占住名额，pump 只挑 WAITING 的任务
   renderTask(t);
   // 速度计算：每 0.3 秒采样一次并平滑，避免数字跳动
   t.lastTick = Date.now(); t.lastBytes = 0; t.speed = 0; t.uploaded = t.uploaded || 0;
   // 先向服务端查有没有同名同大小的未完成任务：
   // tus-js-client 自带的指纹存在浏览器里，清缓存/换浏览器就会失效，
   // 这里按"文件名 + 大小"兜底，保证任何情况下都能从断点续传。
+  // 必须带 include_active=1：暂停后心跳可能还没过期，只查"未在传输"
+  // 会查不到自己的断点，于是从头重传并多出一个副本。
   if (!t.resumeUrl) {
     try {
-      const d = await (await fetch('/api/pending')).json();
+      const d = await (await fetch('/api/pending?include_active=1')).json();
       // mine !== false：只认自己设备发起的未完成任务，避免续写到别人的任务里
       const hit = (d.pending || []).find(p => p.mine !== false &&
         p.name === t.file.name && p.size === t.file.size);
@@ -1120,6 +1272,8 @@ async function startTask(t){
       }
     } catch (e) {}
   }
+  // 查断点期间可能已被调度器转为「排队中」、或被删除，这时不能再启动
+  if (t.killed || t.status !== STATE.UPLOADING) { t.creating = false; return; }
   const opts = {
     endpoint: '/api/upload/',
     uploadUrl: t.resumeUrl || undefined,   // 指定则直接续传该任务
@@ -1149,6 +1303,7 @@ async function startTask(t){
       t.st.textContent = '失败：' + (err && err.message ? err.message : '未知错误');
       renderTask(t);
       refreshPending();
+      pump();                        // 名额空出来，让排队的任务顶上
     },
     onProgress(uploaded, total){
       const now = Date.now(), dt = (now - t.lastTick) / 1000;
@@ -1178,16 +1333,18 @@ async function startTask(t){
       renderTask(t);
       t.el.querySelector('[data-a="del"]').textContent = '清除';
       refresh(); refreshPending();
+      pump();                        // 名额空出来，让排队的任务顶上
       // 短暂停留显示"完成"，随后从上传区移除（文件已进入「全部文件」）
       setTimeout(() => {
         t.el.remove();
         const i = TASKS.indexOf(t);
         if (i >= 0) TASKS.splice(i, 1);
+        syncCards();                 // 卡片数变化，重算折叠角标
       }, 1500);
     }
   };
   t.upload = new tus.Upload(t.file, opts);
-  t.status = STATE.UPLOADING;
+  t.creating = false;
   renderTask(t);
   t.upload.start();
   startBeat(t);
@@ -1202,6 +1359,7 @@ function pauseTask(t){
   t.st.textContent = '已暂停 · ' + p.toFixed(2) + '%（进度已保留）';
   renderTask(t);
   refreshPending();
+  pump();                           // 名额空出来，让排队的任务顶上
 }
 
 async function deleteTask(t){
@@ -1222,11 +1380,13 @@ async function deleteTask(t){
   if (i >= 0) TASKS.splice(i, 1);
   refreshPending();
   refreshRemote();
+  pump();                        // 名额空出来，让排队的任务顶上
 }
 
 function addFiles(files){
   [...files].sort((a, b) => a.size - b.size).forEach(f => {
-    const t = { file: f, upload: null, status: 'new' };
+    // 先入队：有空闲名额时下面的 pump() 会立刻启动，否则显示「排队中」
+    const t = { file: f, upload: null, status: STATE.WAITING };
     // 若刚从某个未完成任务的「继续」进来，且文件匹配，就绑定到那个任务
     if (pendingResume) {
       if (f.name === pendingResume.name && f.size === pendingResume.size) {
@@ -1238,8 +1398,9 @@ function addFiles(files){
     }
     TASKS.push(t);
     document.getElementById('up').appendChild(taskRow(t));
-    startTask(t);
+    renderTask(t);
   });
+  pump();                              // 多选的文件按顺序占用名额，超出的排队
 }
 
 /* ---------------- 其他设备正在上传（跨设备进度同步，只读） ---------------- */
@@ -1281,18 +1442,25 @@ async function refreshRemote(){
 async function refreshPending(){
   let d;
   try {
-    d = await (await fetch('/api/pending')).json();
+    // include_active=1：连"心跳还没过期"的任务一起取回，再在下面精确过滤。
+    // 只取"未在传输"的任务会出现黑洞——页面重载/崩溃后心跳残留的 90 秒内，
+    // 这些任务既不在「未完成」（被 active 过滤），也不在「其他设备正在上传」
+    // （被 sessionStorage 里的本机 uid 过滤），看起来就像任务丢了。
+    d = await (await fetch('/api/pending?include_active=1')).json();
   } catch (e) {
     return;      // 服务端暂时不可达（重启/网络抖动）：跳过本轮，不抛未捕获异常
   }
   const box = document.getElementById('pending');
-  // 前端兜底：把本页面正在正常上传（waiting/uploading）的任务过滤掉，
-  // 避免心跳延迟时同一个任务在两处重复显示
+  // 只排除两类：本页自己正在传的（已有任务卡片）、正被其它设备传的
+  // （在「其他设备正在上传」区域展示）。其余一律列出，保证一个都不丢。
   const live = new Set(TASKS
     .filter(t => t.status === STATE.UPLOADING || t.status === STATE.WAITING)
     .map(taskUid).filter(Boolean));
-  const items = (d.pending || []).filter(p => !live.has(p.uid));
+  const items = (d.pending || []).filter(p =>
+    !live.has(p.uid) && !(p.active && p.mine === false));
   document.getElementById('pendingCard').hidden = items.length === 0;
+  document.getElementById('pendingTitle').textContent =
+    '未完成的任务（' + items.length + '）';
   box.innerHTML = items.map(p => {
     const pct = p.size ? Math.min(100, p.offset / p.size * 100) : 0;
     const pctTxt = pct.toFixed(2);
@@ -1426,8 +1594,9 @@ async function resumePendingTask(uid, name, size) {
                         resumeUrl: '/api/upload/' + uid };
             TASKS.push(t);
             document.getElementById('up').appendChild(taskRow(t));
+            renderTask(t);
             toast('已自动读取原文件，从断点继续');
-            startTask(t);
+            pump();                  // 交给调度器：有空闲名额就立刻开始
             return;
           }
           toast('原文件已变化（大小 ' + fmt(file.size) + '），请重新选择');
@@ -1448,6 +1617,30 @@ async function resumePendingTask(uid, name, size) {
   pendingResume = { uid: uid, name: name, size: size };
   toast('当前环境无法自动读取本地文件，请选中同一个文件以续传');
   pick.click();
+}
+
+/* ---------------- 电脑端目录：显示路径，点击在电脑上打开 ---------------- */
+async function refreshPaths(){
+  const box = document.getElementById('paths');
+  if (!box) return;
+  let d;
+  try { d = await (await fetch('/api/paths')).json(); } catch (e) { return; }
+  const item = (key, label, path, title) =>
+    '<button class="mini" data-dir="' + key + '" title="' + esc(title) + '">'
+    + label + '</button> <span class="tag">' + esc(path) + '</span>　';
+  box.innerHTML = '电脑端目录（点击在电脑上打开）：'
+    + item('config', '接收/配置', d.config_dir, '接收到的文件与配置文件所在目录')
+    + item('log', '日志', d.log_dir, '运行日志 app.log 所在目录');
+  box.querySelectorAll('button[data-dir]').forEach(b => {
+    b.onclick = async () => {
+      const r = await apiFetch('/api/open-dir', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({key: b.dataset.dir})
+      });
+      toast(r.ok ? '已在电脑上打开该目录' : (r.detail || '打开失败'));
+    };
+  });
 }
 
 /* 刷新文件列表 */
@@ -1496,17 +1689,22 @@ async function refresh(){
   }
   document.getElementById('empty').style.display = files.length ? 'none' : 'block';
   document.getElementById('empty').textContent = files.length ? '' : '暂无文件';
+  const queued = queuedCount();
   document.getElementById('info').textContent =
     '共 ' + (d.count || files.length) + ' 个文件 / ' + fmt(d.total || 0) + '　剩余磁盘 ' + fmt(d.free || 0)
+    + '　并行上限 ' + maxParallel + (queued ? '（排队 ' + queued + '）' : '')
     + '　地址 ' + location.origin;
 }
 refresh();
 refreshPending();
 refreshRemote();
+syncSettings();
+refreshPaths();
 renderTips();
 setInterval(refresh, 3000);
 setInterval(refreshPending, 3000);
 setInterval(refreshRemote, 1500);
+setInterval(syncSettings, 2000);   // 持续跟随程序端的并行任务数
 
 /* 页面刷新 / 关闭时立即释放「上传中」标记。
    否则服务端要等心跳超时（约 90 秒）才把任务归入「未完成」，这段时间里
@@ -1554,6 +1752,7 @@ def create_app() -> FastAPI:
     global TUS_OPTIONS
     patch_tus_windows_rename()  # Windows 覆盖 .info 的兼容修复
     ensure_dirs()
+    load_settings()             # 恢复上次的并行任务上限
 
     app = FastAPI(title="局域网文件传输工具", docs_url=None, redoc_url=None)
 
@@ -1684,6 +1883,65 @@ def create_app() -> FastAPI:
         digest = await asyncio.to_thread(sha256_of, path)
         ok = digest == item.get("sha256")
         return {"ok": ok, "sha256": digest, "recorded": item.get("sha256")}
+
+    @app.get("/api/paths")
+    async def api_paths():
+        """本机目录信息，供程序端与网页端展示并可点击打开。
+
+        配置文件（.settings.json / .local_tasks.json）与接收到的文件同在
+        uploads 目录，所以 config_dir 与 upload_dir 是同一个路径。
+        """
+        return {
+            "base": BASE_DIR,
+            "upload_dir": UPLOAD_DIR,
+            "config_dir": UPLOAD_DIR,
+            "config_file": SETTINGS_PATH,
+            "log_dir": LOG_DIR,
+            "log_file": LOG_PATH,
+        }
+
+    @app.post("/api/open-dir")
+    async def api_open_dir(request: Request):
+        """在**服务端这台电脑**上打开目录（网页端点击目录时调用）。
+
+        只接受 OPENABLE_DIRS 里的固定 key，不接受任意路径。
+        """
+        try:
+            payload = await request.json()
+            key = str(payload.get("key") or "")
+        except (ValueError, TypeError, AttributeError):
+            key = ""
+        target = OPENABLE_DIRS.get(key)
+        if not target:
+            raise HTTPException(status_code=400, detail="目录标识非法")
+        if not await asyncio.to_thread(open_local_dir, target):
+            raise HTTPException(status_code=500, detail="无法打开该目录")
+        return {"ok": True, "path": target}
+
+    @app.get("/api/settings")
+    async def api_settings():
+        """当前并行任务上限。
+
+        程序端下拉框与网页端排队逻辑共用这一个值：网页端每 2 秒轮询本接口，
+        发现数字变小就把超出名额的任务转成「排队中」，腾出名额后再自动续传。
+        """
+        return {"max_parallel": PARALLEL["value"], "limit": PARALLEL_LIMIT_MAX}
+
+    @app.post("/api/settings")
+    async def api_set_settings(request: Request):
+        """修改并行任务上限（1 ~ PARALLEL_LIMIT_MAX），立即持久化。"""
+        try:
+            payload = await request.json()
+            value = int(payload.get("max_parallel"))
+        except (ValueError, TypeError, AttributeError):
+            raise HTTPException(status_code=400, detail="max_parallel 必须是整数")
+        if not 1 <= value <= PARALLEL_LIMIT_MAX:
+            raise HTTPException(
+                status_code=400,
+                detail=f"max_parallel 需在 1~{PARALLEL_LIMIT_MAX} 之间")
+        PARALLEL["value"] = value
+        await asyncio.to_thread(save_settings)
+        return {"ok": True, "max_parallel": value}
 
     @app.get("/api/space")
     async def api_space():

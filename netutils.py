@@ -14,6 +14,36 @@ PRIVATE_PREFIX = ("192.168.", "10.", "172.16.", "172.17.", "172.18.", "172.19.",
                   "172.2", "172.30.", "172.31.")
 
 
+def run_text(cmd: list, timeout: int = 8) -> str:
+    """执行系统命令并返回文本输出（解码失败也绝不抛异常）。
+
+    为什么不用 ``subprocess.run(..., text=True)``
+    --------------------------------------------
+    ``ipconfig`` / ``arp`` / ``nbtstat`` 等 Windows 命令输出的是 OEM/ANSI
+    代码页（中文系统为 GBK）字节，而 ``text=True`` 会用
+    ``locale.getpreferredencoding()`` 解码。一旦进程运行在 **UTF-8 模式**
+    （``PYTHONUTF8=1``；Python 3.15 起为默认），该值变成 utf-8，GBK 字节
+    解析失败——异常发生在 subprocess 的读取线程内部，会往控制台打印一整段
+    ``Exception in thread ... (_readerthread)`` 堆栈，用户误以为程序崩溃。
+
+    这里统一改为「先按 Windows 本地代码页解码，失败再退回 GBK / UTF-8 宽容
+    解码」，保证任何代码页下都只返回字符串、不产生堆栈噪音。
+    """
+    kwargs = {"capture_output": True, "timeout": timeout}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW：不闪黑框
+    try:
+        raw = subprocess.run(cmd, **kwargs).stdout or b""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    for encoding in ("mbcs", "gbk", "utf-8"):
+        try:
+            return raw.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw.decode("utf-8", "replace")
+
+
 def _probe_ip() -> str:
     """UDP 套接字连接不会真正发包，但系统会按路由表选出网卡，从而得到该网卡 IP。"""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -43,9 +73,7 @@ def list_lan_ips() -> list:
 
     if sys.platform == "win32":
         try:
-            out = subprocess.run(["ipconfig"], capture_output=True, text=True,
-                                 timeout=8, creationflags=0x08000000).stdout
-            for line in out.splitlines():
+            for line in run_text(["ipconfig"], timeout=8).splitlines():
                 if "IPv4" in line:
                     part = line.split(":")[-1].strip()
                     if part[:1].isdigit():
@@ -54,9 +82,7 @@ def list_lan_ips() -> list:
             pass
     else:
         try:
-            out = subprocess.run(["hostname", "-I"], capture_output=True,
-                                 text=True, timeout=5).stdout
-            for ip in out.split():
+            for ip in run_text(["hostname", "-I"], timeout=5).split():
                 add(ip)
         except Exception:
             pass

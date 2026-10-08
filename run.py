@@ -62,6 +62,9 @@ def _install_fast_exit() -> None:
 def main() -> None:
     """加载 main.py 并启动（延迟导入，保证钩子先装好）。"""
     _install_fast_exit()
+    # 依赖自举：必须在导入 main（其内部会导入第三方库）之前完成
+    import runtime
+    runtime.ensure_runtime(os.path.abspath(__file__))
     import main as app_entry
     app_entry.main()
 

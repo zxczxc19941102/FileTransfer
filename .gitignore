@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 .codebuddy/
 uploads/
+logs/
 lan_qrcode.png
 build/
 dist/

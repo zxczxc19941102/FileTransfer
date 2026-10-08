@@ -949,10 +949,24 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
     root.protocol("WM_DELETE_WINDOW", on_close)
 
     def tick():
-        refresh_tree()
-        root.after(2000, tick)
+        """定时刷新「已接收文件」列表。
 
-    refresh_tree()
+        必须保证任何情况下都能重新排期：早期直接调用 refresh_tree，
+        一旦它抛异常（例如 uploads\\.meta 被删掉），下面的 root.after 就
+        执行不到，自动刷新会**永久停摆**——表现出来就是"本地文件删了，
+        客户端列表也不再更新"。
+        """
+        try:
+            refresh_tree()
+        except Exception as exc:
+            report_gui_error(f"刷新文件列表失败：{exc}")
+        finally:
+            root.after(2000, tick)
+
+    try:
+        refresh_tree()
+    except Exception as exc:
+        report_gui_error(f"首次读取文件列表失败：{exc}")
     root.after(500, tick)
     root.mainloop()
 

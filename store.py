@@ -671,8 +671,16 @@ def write_meta(file_id: str, data: dict):
 
 
 def read_all_meta() -> list:
-    """读取全部元数据，按完成时间倒序。"""
+    """读取全部元数据，按接收时间倒序；源文件已被删除的记录自动跳过。
+
+    ``.meta`` 目录本身也可能不存在（用户把 uploads 下的内容删掉了），
+    这里必须容错返回空列表：早期直接 ``os.listdir`` 会抛 FileNotFoundError，
+    而该异常发生在 Tk 定时回调里，会让界面自动刷新**永久停摆**——
+    表现出来就是"文件删了，客户端列表也不跟着更新"。
+    """
     items = []
+    if not os.path.isdir(META_DIR):
+        return items
     for name in os.listdir(META_DIR):
         if not name.endswith(".json"):
             continue
@@ -823,6 +831,38 @@ def purge_once() -> int:
     return removed
 
 
+def purge_missing_records() -> int:
+    """清理「源文件已不存在」的元数据记录，返回清理条数。
+
+    只在该记录所在目录**仍然存在**时才判定为"文件被删了"；如果整个目录都
+    不见了（磁盘未挂载、目录被整体移走），一律不动，避免误删记录。
+    """
+    if not os.path.isdir(META_DIR):
+        return 0
+    removed = 0
+    for name in os.listdir(META_DIR):
+        if not name.endswith(".json"):
+            continue
+        record = os.path.join(META_DIR, name)
+        try:
+            with open(record, "r", encoding="utf-8") as fp:
+                target = json.load(fp).get("path") or ""
+        except (OSError, ValueError):
+            continue                      # 读不出来的坏记录留给人工处理
+        folder = os.path.dirname(target)
+        if not target or not os.path.isdir(folder):
+            continue                      # 连目录都不在：不判定为删除
+        try:
+            if not os.path.isfile(target):
+                os.remove(record)
+                removed += 1
+        except OSError:
+            pass
+    if removed:
+        print(f"[清理] 移除 {removed} 条源文件已被删除的记录", flush=True)
+    return removed
+
+
 def cleanup_expired(days: int = EXPIRE_DAYS) -> int:
     """清理超过保留期的未完成分片，返回清理的文件数。
 
@@ -830,6 +870,8 @@ def cleanup_expired(days: int = EXPIRE_DAYS) -> int:
       1) 带 .info 且已过期的上传（按 TUS 规范 expires 为 HTTP 日期格式解析）；
       2) 没有任何 .info 关联的孤立分片文件（进程被强杀等异常残留）。
     """
+    if not os.path.isdir(TUS_DIR):
+        return 0
     removed = 0
     now = datetime.now()
     deadline = now - timedelta(days=days)
@@ -2130,6 +2172,11 @@ async def _gc_loop():
         if rounds % per_hour == 0:
             try:
                 await asyncio.to_thread(cleanup_expired)
+            except Exception:
+                pass
+            # 源文件被手动删除后，把对应的元数据记录也清掉，列表不会长期残留
+            try:
+                await asyncio.to_thread(purge_missing_records)
             except Exception:
                 pass
         rounds += 1

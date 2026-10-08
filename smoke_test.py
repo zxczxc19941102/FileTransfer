@@ -13,14 +13,16 @@
 8. 并行任务数设置：默认值 / 设置 / 越界拒绝 / 持久化
 9. 多个未完成任务必须**全部**返回（回归用例）
 10. 目录信息接口：路径齐全、目录真实存在；打开目录接口只放行白名单
-11. 本机上传器 UploadTask（GUI 上传用的客户端）完整走通一次上传
-12. 局域网监听：默认 --host=0.0.0.0 时经**局域网 IP** 可达、横幅与二维码用该 IP；
+11. 本地文件删除后的列表同步：磁盘文件删掉后接口不再返回该条目；
+    .meta 目录整个缺失时读取/清理均不得抛异常（回归用例）
+12. 本机上传器 UploadTask（GUI 上传用的客户端）完整走通一次上传
+13. 局域网监听：默认 --host=0.0.0.0 时经**局域网 IP** 可达、横幅与二维码用该 IP；
     同时模拟 Clash 系统代理（HTTP_PROXY/ALL_PROXY 指向不存在的端口），
     验证经局域网 IP 的上传、下载与本机上传器均不受影响
-13. 优雅关闭：should_exit 后监听线程正常停止，无残留
-14. run.py 推荐入口同样可启动并服务
-15. 图形界面：真实创建 tkinter 窗口 + 渲染二维码 + Treeview 增量刷新不丢选中
-16. 日志检查：服务端日志中不含 Traceback / ERROR，且启动输出已落盘到 logs/app.log
+14. 优雅关闭：should_exit 后监听线程正常停止，无残留
+15. run.py 推荐入口同样可启动并服务
+16. 图形界面：真实创建 tkinter 窗口 + 渲染二维码 + Treeview 增量刷新不丢选中
+17. 日志检查：服务端日志中不含 Traceback / ERROR，且启动输出已落盘到 logs/app.log
 
 说明：脚本刻意在子进程里开启 UTF-8 模式（PYTHONUTF8=1，Python 3.15 起为
 默认），这是系统命令输出解码最容易出问题的配置，可验证其健壮性。
@@ -184,7 +186,7 @@ def purge_artifacts() -> int:
 
 def t_graceful_shutdown():
     """进程内验证服务端优雅关闭路径（should_exit → 监听线程停止）。"""
-    print("\n== 11. 服务优雅关闭 ==")
+    print("\n== 12. 服务优雅关闭 ==")
     sys.path.insert(0, BASE)
     import main as entry
 
@@ -515,6 +517,98 @@ def t_pending_multi():
     jreq("DELETE", f"/api/pending/{uids[2]}")
 
 
+def t_file_removal_sync():
+    """本地磁盘文件被删除后，列表必须同步移除。
+
+    网页端与程序端都读 /api/files（进而读 read_all_meta），所以这里验证的是
+    两端的共同数据源；同时覆盖引发过"客户端列表卡死"的两个缺陷：
+      - .meta 目录整个缺失时不得抛异常（否则 Tk 定时回调中断，刷新永久停摆）
+      - 失效记录会被定期清理，且不会误删"所在目录整体不存在"的记录
+    """
+    print("\n== 9. 本地文件删除后的列表同步 ==")
+    name = "冒烟测试-删除同步.bin"
+    src = os.path.join(TMP_DIR, name)
+    size = 128 * 1024
+    make_blob(src, size)
+    status, hdrs, _ = req("POST", "/api/upload/", body=b"", headers={
+        "Tus-Resumable": "1.0.0", "Upload-Length": str(size),
+        "Upload-Metadata": meta_header(name)})
+    if not check("创建待删除的测试文件", status == 201, f"HTTP {status}"):
+        return
+    upath = "/api/upload/" + hdrs["location"].rstrip("/").rsplit("/", 1)[-1]
+    with open(src, "rb") as fp:
+        blob = fp.read()
+    req("PATCH", upath, body=blob, headers={
+        "Tus-Resumable": "1.0.0", "Upload-Offset": "0",
+        "Content-Type": "application/offset+octet-stream"})
+
+    found = False
+    deadline = time.time() + 40
+    while time.time() < deadline:
+        _, _, data = jreq("GET", "/api/files")
+        if any(f["name"] == name for f in data.get("files", [])):
+            found = True
+            break
+        time.sleep(0.3)
+    if not check("上传完成并出现在列表中", found):
+        return
+
+    disk = os.path.join(UPLOAD_DIR, name)
+    if not check("物理文件确实存在", os.path.isfile(disk), disk):
+        return
+    os.remove(disk)                        # 模拟用户从资源管理器里删掉文件
+    _, _, data = jreq("GET", "/api/files")
+    check("磁盘文件删除后，接口立即不再返回该条目",
+          not any(f["name"] == name for f in data.get("files", [])),
+          f"count={data.get('count')}")
+
+    # ---- .meta 目录整个缺失：读取与清理都必须容错 ----
+    sys.path.insert(0, BASE)
+    import store as store_mod
+    real_meta = store_mod.META_DIR
+    store_mod.META_DIR = os.path.join(TMP_DIR, "不存在的meta")
+    try:
+        try:
+            got = store_mod.read_all_meta()
+        except Exception as exc:            # noqa: BLE001
+            got = repr(exc)
+        check("META_DIR 不存在时 read_all_meta 返回空列表而不抛异常",
+              got == [], repr(got)[:90])
+        try:
+            zero = store_mod.purge_missing_records()
+        except Exception as exc:            # noqa: BLE001
+            zero = repr(exc)
+        check("META_DIR 不存在时 purge_missing_records 返回 0 而不抛异常",
+              zero == 0, repr(zero)[:90])
+    finally:
+        store_mod.META_DIR = real_meta
+
+    # ---- 失效记录清理，且不误删"所在目录整体不存在"的记录 ----
+    tmp_meta = os.path.join(TMP_DIR, "meta")
+    os.makedirs(tmp_meta, exist_ok=True)
+    kept = os.path.join(TMP_DIR, "保留.bin")
+    vanished = os.path.join(TMP_DIR, "已删除.bin")
+    for one in (kept, vanished):
+        with open(one, "wb") as fp:
+            fp.write(b"x")
+    store_mod.META_DIR = tmp_meta
+    try:
+        store_mod.write_meta("keep01", {"id": "keep01", "path": kept})
+        store_mod.write_meta("gone01", {"id": "gone01", "path": vanished})
+        store_mod.write_meta("nodir1", {"id": "nodir1",
+                                        "path": os.path.join(TMP_DIR, "没这个目录", "x")})
+        os.remove(vanished)
+        removed = store_mod.purge_missing_records()
+        left = set(os.listdir(tmp_meta))
+        check("清理掉源文件已删除的记录",
+              removed == 1 and "gone01.json" not in left,
+              f"removed={removed} left={sorted(left)}")
+        check("源文件仍在的记录不动", "keep01.json" in left)
+        check("所在目录整体不存在时不误删记录", "nodir1.json" in left)
+    finally:
+        store_mod.META_DIR = real_meta
+
+
 def t_paths_and_open():
     """目录信息接口 + 「在电脑上打开目录」接口。"""
     print("\n== 8. 目录信息与打开目录 ==")
@@ -602,7 +696,7 @@ def t_page_and_apis():
 
 def t_local_uploader():
     """本机上传器（GUI 使用的 UploadTask）走通一次完整上传。"""
-    print("\n== 9. 本机上传器（UploadTask）==")
+    print("\n== 10. 本机上传器（UploadTask）==")
     sys.path.insert(0, BASE)
     import uploader
     src = os.path.join(TMP_DIR, "冒烟测试-本机上传器.bin")
@@ -637,7 +731,7 @@ def t_local_uploader():
 
 def t_run_py_entry():
     """验证推荐入口 run.py 也能正常启动并服务（含快速退出钩子）。"""
-    print("\n== 12. run.py 入口启动 ==")
+    print("\n== 13. run.py 入口启动 ==")
     port = free_port()
     env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
     log_path = os.path.join(BASE, "smoke_run_entry.log")
@@ -677,7 +771,7 @@ def t_run_py_entry():
 
 def t_gui_window():
     """验证 GUI 关键路径：真实创建 Tk 窗口 + 渲染二维码 + 读取本机信息。"""
-    print("\n== 13. 图形界面（tkinter 窗口）==")
+    print("\n== 14. 图形界面（tkinter 窗口）==")
     sys.path.insert(0, BASE)
     try:
         import tkinter as tk
@@ -749,7 +843,7 @@ def t_lan_and_proxy():
       3. 模拟 Clash 系统代理（代理指向不存在的端口）时，
          经局域网 IP 的上传 / 下载 / 本机上传器全部照常工作。
     """
-    print("\n== 10. 局域网监听 + 系统代理（Clash 非 TUN）兼容性 ==")
+    print("\n== 11. 局域网监听 + 系统代理（Clash 非 TUN）兼容性 ==")
     sys.path.insert(0, BASE)
     from netutils import get_lan_ip
 
@@ -914,6 +1008,7 @@ def main():
         t_parallel_settings()
         t_pending_multi()
         t_paths_and_open()
+        t_file_removal_sync()
         t_local_uploader()
         t_lan_and_proxy()
 
@@ -938,7 +1033,7 @@ def main():
     t_gui_window()
 
     # ---- 检查服务端日志 ----
-    print("\n== 14. 服务端日志检查 ==")
+    print("\n== 15. 服务端日志检查 ==")
     with open(LOG_PATH, encoding="utf-8", errors="replace") as fp:
         log_text = fp.read()
     tb = re.findall(r"Traceback \(most recent call last\)", log_text)
@@ -959,7 +1054,7 @@ def main():
         print("  [注意] 日志中有警告：" + "; ".join(warn[:3]))
 
     # ---- 清理测试残留 ----
-    print("\n== 15. 清理测试产物 ==")
+    print("\n== 16. 清理测试产物 ==")
     removed = purge_artifacts()
     shutil.rmtree(TMP_DIR, ignore_errors=True)
     for artifact in ("lan_qrcode.png", "smoke_run_entry.log", "smoke_lan.log"):

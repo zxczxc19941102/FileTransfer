@@ -93,6 +93,12 @@ SPEED_LIMIT_MIN = 1 << 20           # 1 MB/s
 SPEED_LIMIT_DEFAULT = 0             # 0 = 无限制
 SPEED_LIMIT = {"value": SPEED_LIMIT_DEFAULT}
 
+# ---- 启动后是否自动用本机默认浏览器打开网页 ----
+# 默认**不自动打开**：每次启动都弹一个浏览器标签很打扰，而窗口顶部那行访问
+# 地址本身就是链接，需要时点一下就打开了。窗口中的「启动时自动打开网页」
+# 勾选框改的就是这个值，改动会写进 .settings.json，下次启动生效。
+AUTO_OPEN_BROWSER = {"value": False}
+
 SETTINGS_PATH = os.path.join(UPLOAD_DIR, ".settings.json")
 
 # 当前请求的客户端 IP（由 HTTP 中间件在进入业务处理前写入）。
@@ -147,7 +153,7 @@ def open_local_dir(path: str) -> bool:
 
 
 def load_settings():
-    """读取持久化的设置（并行任务上限、上传限速），异常时保留默认值。"""
+    """读取持久化的设置（并行任务上限、上传限速、启动时打开网页），异常时保留默认值。"""
     try:
         with open(SETTINGS_PATH, "r", encoding="utf-8") as fp:
             data = json.load(fp)
@@ -163,6 +169,9 @@ def load_settings():
     limit = data.get("speed_limit")
     if isinstance(limit, (int, float)) and (limit == 0 or limit >= SPEED_LIMIT_MIN):
         SPEED_LIMIT["value"] = int(limit)
+    # 只接受真正的布尔值：字符串 "false" 会被 bool() 判成 True，必须显式判断
+    if isinstance(data.get("open_browser"), bool):
+        AUTO_OPEN_BROWSER["value"] = data["open_browser"]
 
 
 def save_settings():
@@ -171,7 +180,8 @@ def save_settings():
     try:
         with open(tmp, "w", encoding="utf-8") as fp:
             json.dump({"max_parallel": PARALLEL["value"],
-                       "speed_limit": SPEED_LIMIT["value"]}, fp)
+                       "speed_limit": SPEED_LIMIT["value"],
+                       "open_browser": AUTO_OPEN_BROWSER["value"]}, fp)
         os.replace(tmp, SETTINGS_PATH)
     except OSError:
         pass
@@ -213,6 +223,12 @@ def build_streaming_storage():
             """原子写 sidecar；Windows 下 rename 不能覆盖，用 replace。"""
 
             def _do() -> None:
+                # 任务已被删除：绝不能再把 sidecar 写回来。append 有同样的拦截，
+                # 但 write_info 之前漏了——删除瞬间正在处理的那个 PATCH 会在
+                # 文件被删掉之后重新写出 .info，服务端就留下一个空壳任务
+                # （要等几十秒后的竞态复查才被清掉，期间网页端还会闪一下）。
+                if is_dropped(uid):
+                    return
                 self._ensure_dir()
                 path = self._info_path(uid)
                 tmp = f"{path}.tmp"
@@ -316,6 +332,21 @@ def disk_free(path: str) -> int:
 DEVICE_CACHE: dict = {}      # ip -> {"name": str, "mac": str}
 DEVICE_CACHE_TTL = 60        # 缓存秒数
 CLIENT_MAP: dict = {}        # 上传 ID(uid) -> 客户端 IP，由 HTTP 中间件登记
+# 程序端上传器在 Upload-Metadata 里带的自有标记（键名，值为 "1"）。
+# 为什么需要它：程序端上传器与「本机浏览器」的来源 IP 都是 127.0.0.1，
+# 光看 IP 分不清两者。而程序端的断点续传检索（uploader._find_existing）
+# 只按「文件名 + 大小」认领未完成任务——一旦认领了浏览器正在写的那个，
+# 两个写入者就会同时往同一个 TUS 资源里追加，触发锁文件争用
+# （Error removing lock file / WinError 32）；同名不同内容时还会写坏文件。
+# 放进 Upload-Metadata 而不是进程内存，是为了跨服务重启依然有效
+# （强杀后重启，程序端仍要能找回自己的断点继续传）。
+LOCAL_UPLOADER_KEY = "local"
+# 程序端上传器在 Upload-Metadata 里带的**源文件绝对路径**（键名）。
+# 判重的键必须是它，而不是文件名：不同文件夹里的同名文件是两个不同的文件，
+# 必须都能上传（落盘时 unique_path 会加 (1)(2) 区分）。只有"同一台机器上的
+# 同一个文件"（绝对路径相同）才算重复。
+# 浏览器出于安全限制拿不到绝对路径，网页端上传不带这个字段，也就不参与判重。
+SRC_PATH_KEY = "srcpath"
 ACTIVE_UPLOADS: dict = {}    # uid -> {"ts":…, "uploaded":…, "speed":…}，区分"正在上传"与"已中断"
 ACTIVE_TTL = 90              # 心跳超过该秒数未刷新，视为上传已中断（页面关闭/崩溃/断网）
 PAUSED_UIDS: dict = {}        # uid -> 操作者 IP，被要求暂停的上传（等客户端心跳确认）
@@ -571,7 +602,8 @@ def viewer_is_owner(uid: str, viewer_ip: str) -> bool:
     return owner == viewer_ip or (owner in LOCAL_HOSTS and viewer_ip in LOCAL_HOSTS)
 
 
-def scan_pending_uploads(include_active: bool = False, viewer_ip: str = "") -> list:
+def scan_pending_uploads(include_active: bool = False, viewer_ip: str = "",
+                         with_device: bool = True) -> list:
     """扫描 TUS 工作目录，返回**未完成**的上传任务列表。
 
     程序被强制关闭后，已传分片和 .info 仍留在磁盘上，这里就能把它们
@@ -607,7 +639,10 @@ def scan_pending_uploads(include_active: bool = False, viewer_ip: str = "") -> l
             continue  # 正在上传：只应出现在"上传中"区域，避免两处重复
         meta = info.get("metadata") or {}
         client_ip = CLIENT_MAP.get(uid, "")
-        device = device_info(client_ip) if client_ip else {"name": "", "mac": ""}
+        # with_device=False 时跳过 IP 反查（DNS/NetBIOS 可能阻塞数秒）。
+        # 程序端底部那行提示要跟着列表每 2 秒刷新，绝不能带上这个开销。
+        device = (device_info(client_ip) if client_ip and with_device
+                  else {"name": "", "mac": ""})
         pending.append({
             "uid": uid,
             "name": clean_name(meta.get("filename") or uid),
@@ -619,6 +654,10 @@ def scan_pending_uploads(include_active: bool = False, viewer_ip: str = "") -> l
             "active": active,
             "active_elapsed": int(now - ACTIVE_UPLOADS[uid]["ts"]) if active else 0,
             "local_task": task_is_local(uid),
+            # 是否由**程序端上传器**发起（见 LOCAL_UPLOADER_KEY 说明）。
+            # 断点续传只认领自己发起的任务：认领了浏览器正在写的任务，
+            # 两个写入者会同时往同一个资源里追加。
+            "local_uploader": str(meta.get(LOCAL_UPLOADER_KEY) or "") == "1",
             "mine": viewer_is_owner(uid, viewer_ip),
             "uploaded_at": info.get("created_at") or "",
         })
@@ -697,6 +736,23 @@ def write_meta(file_id: str, data: dict):
         json.dump(data, fp, ensure_ascii=False, indent=1)
 
 
+def find_record_by_src_path(src_path: str) -> dict:
+    """按客户端上报的**源文件绝对路径**查找已接收的记录，没有则返回空字典。
+
+    比较用 ``os.path.normcase``：Windows 下同一个路径的大小写写法应当视为同一个
+    （Linux 上 normcase 是恒等函数，不影响）。
+    只认 ``read_all_meta()`` 里"接收到的文件仍在"的记录——用户把接收到的文件
+    删掉之后，同一个源文件应当允许重新上传。
+    """
+    if not src_path:
+        return {}
+    want = os.path.normcase(src_path)
+    for item in read_all_meta():
+        if os.path.normcase(item.get("src_path") or "") == want:
+            return item
+    return {}
+
+
 def read_all_meta() -> list:
     """读取全部元数据，按接收时间倒序；源文件已被删除的记录自动跳过。
 
@@ -735,12 +791,27 @@ RESERVE_MARGIN = 1 << 30  # 1GB 安全余量
 
 
 def pre_create_hook(metadata: dict, upload_info: dict):
-    """上传创建前校验磁盘空间，不足直接拒绝（返回 507）。
+    """上传创建前校验：该源文件是否已上传过 + 磁盘空间是否够。
 
     tuspyserver 的 pre_create 钩子在解析完 Upload-Length 之后调用，
     upload_info["size"] 即客户端声明的文件总大小；这里抛 HTTPException
-    会被 FastAPI 异常处理器捕获，浏览器收到标准的 507 响应。
+    会被 FastAPI 异常处理器捕获，客户端收到对应状态码。
+
+    判重规则（用户需求）：**源文件绝对路径相同 → 上传失败**。
+    文件名不能当判重键——不同文件夹里的同名文件是两个不同的文件，都得能传。
+    只有客户端主动上报了绝对路径（程序端上传器）才会判重；浏览器拿不到
+    绝对路径，其上传不参与判重。
     """
+    src_path = str((metadata or {}).get(SRC_PATH_KEY) or "").strip()
+    if src_path:
+        dup = find_record_by_src_path(src_path)
+        if dup:
+            raise HTTPException(
+                status_code=409,
+                detail=f"该文件已上传过（源路径相同）：{src_path}\n"
+                       f"已存在的副本是 {dup.get('name')}。"
+                       f"如需重新上传，请先在文件列表里删除该记录。")
+
     size = upload_info.get("size") or 0
     if size <= 0:
         return  # 长度未知（defer-length）时不拦截
@@ -801,6 +872,9 @@ async def on_upload_complete(file_path: str, info: dict):
             "client_ip": client_ip,
             "client_name": device["name"],
             "client_mac": device["mac"],
+            # 客户端上报的源文件绝对路径（浏览器不提供，故为空）。
+            # 留着是为了判重：同一路径再次上传直接拒绝（见 pre_create_hook）。
+            "src_path": str(meta.get(SRC_PATH_KEY) or ""),
         })
         print(f"[完成] {os.path.basename(final_path)}  {human_size(size)}  sha256={digest[:16]}…", flush=True)
 
@@ -1093,6 +1167,15 @@ const STATE_TEXT = {
   error: '失败', completed: '已完成',
 };
 const TASKS = [];   // {file, upload, el, status, uid}
+
+/* 判断是不是"同一个本地文件"。
+   浏览器出于安全限制拿不到绝对路径，只能用「名称 + 大小 + 修改时间」当身份。
+   刻意**不**按文件名判重：不同文件夹里的同名文件是两个不同的文件，都得能传
+   （服务端按绝对路径判重，落盘时用 (1)(2) 区分同名的不同文件）。 */
+function sameFile(a, b){
+  return a.name === b.name && a.size === b.size
+      && (a.lastModified || 0) === (b.lastModified || 0);
+}
 let pendingResume = null;   // 点「继续」后待绑定的未完成任务
 
 /* ---------------- 并行任务上限（与程序端下拉框同步） ----------------
@@ -1163,6 +1246,7 @@ async function syncSettings(){
   if (speed !== speedLimit) {
     speedLimit = speed;
     applySpeedSelect();
+    reapplySpeedToTasks();        // 改限速：重设基准并重建分片，立即生效
     if (!first) notes.push(speed ? '限速 ' + (speed / 1048576) + ' MB/s' : '取消限速');
   }
   maxParallelReady = true;
@@ -1174,6 +1258,26 @@ async function syncSettings(){
 function markRateStart(t){
   t.rateBase = t.uploaded || 0;
   t.rateStart = Date.now();
+}
+
+/* 改限速后重设速率基准，并重建「正在上传」的任务。
+   分片大小在创建 Upload 时按限速决定，重建才能套用新分片；同时清掉旧的
+   时间基准，否则会出两类毛病：改到更小（如 1 MB/s）时要先"补等"之前全速
+   传的字节、任务卡死像暂停；改到更大（如 10 MB/s）又因为旧基准下欠账为负，
+   在追平前一直全速跑，看起来限速失效。 */
+function reapplySpeedToTasks(){
+  TASKS.forEach(t => {
+    if (t.status === STATE.UPLOADING && t.upload) {
+      const url = t.upload.url || t.resumeUrl || '';
+      try { t.upload.abort(); } catch (e) {}
+      t.upload = null;
+      t.creating = false;
+      t.resumeUrl = url;
+      startTask(t);               // 用新 chunkSize 重建并从服务端偏移续传
+    } else {
+      markRateStart(t);
+    }
+  });
 }
 
 /* 记住"本标签页发起过的上传 ID"。
@@ -1374,15 +1478,16 @@ async function startTask(t){
     chunkSize: speedLimit
       ? Math.max(64 * 1024, Math.min(32 * 1024 * 1024, speedLimit))
       : 32 * 1024 * 1024,
-    // 限速节流：tus-js-client 会 await 本回调，返回 Promise 即可延后本次请求
+    // 限速节流：tus-js-client 会 await 本回调，返回 Promise 即可延后本次请求。
+    // 分片大小已按限速压到约 1 秒的数据量，所以这里等待通常 ≤1 秒，等满即可
+    // 保证平均速率不超限。不再对单次等待设上限——那样会让大分片"破限"。
     onBeforeRequest: () => new Promise((resolve) => {
       if (!speedLimit) { resolve(); return; }
       if (!t.rateStart) markRateStart(t);
       const sent = Math.max(0, (t.uploaded || 0) - (t.rateBase || 0));
       const waitMs = sent / speedLimit * 1000 - (Date.now() - t.rateStart);
       if (waitMs <= 0) { resolve(); return; }
-      // 单次最多等 2 秒：不破坏长期平均速率，也不至于让暂停/取消迟迟不响应
-      setTimeout(resolve, Math.min(waitMs, 2000));
+      setTimeout(resolve, waitMs);
     }),
     retryDelays: [0, 1000, 3000, 5000, 10000, 20000, 30000, 60000],
     // 不用浏览器指纹（localStorage）：它指向的旧任务可能已被删除，
@@ -1492,17 +1597,29 @@ async function deleteTask(t){
 
 function addFiles(files){
   [...files].sort((a, b) => a.size - b.size).forEach(f => {
-    // 先入队：有空闲名额时下面的 pump() 会立刻启动，否则显示「排队中」
-    const t = { file: f, upload: null, status: STATE.WAITING };
-    // 若刚从某个未完成任务的「继续」进来，且文件匹配，就绑定到那个任务
+    // 若刚从某个未完成任务的「继续」进来，且文件匹配，就绑定到那个任务。
+    // 续传优先于下面的重复剔除：未完成的任务本来就不在已接收列表里。
+    let resumeUrl = '';
     if (pendingResume) {
       if (f.name === pendingResume.name && f.size === pendingResume.size) {
-        t.resumeUrl = '/api/upload/' + pendingResume.uid;
+        resumeUrl = '/api/upload/' + pendingResume.uid;
       } else {
         toast('所选文件与待续传任务不一致，将作为新任务上传');
       }
       pendingResume = null;
     }
+    if (!resumeUrl) {
+      // 本页已有**同一个文件**且还没结束：再排一次只会白传一遍、多出一个副本
+      if (TASKS.some(t => sameFile(t.file, f)
+                        && t.status !== STATE.COMPLETED
+                        && t.status !== STATE.ERROR)) {
+        toast('已跳过重复文件：' + f.name + '（已在下方任务列表中）');
+        return;
+      }
+    }
+    // 入队；有空闲名额时 pump() 会立刻启动，否则显示「排队中」
+    const t = { file: f, upload: null, status: STATE.WAITING };
+    if (resumeUrl) t.resumeUrl = resumeUrl;
     TASKS.push(t);
     document.getElementById('up').appendChild(taskRow(t));
     renderTask(t);
@@ -1575,18 +1692,28 @@ async function refreshPending(){
     const pctTxt = pct.toFixed(2);
     // 别人的任务只能只读展示（服务端同样会 403），按钮置灰并给出原因
     const mine = p.mine !== false;
+    // active = 心跳还在：任务**正在传输**（例如电脑端程序在工作）。
+    // 这一类必须显示成「上传中」而不是「已暂停」，否则看着像被暂停了，
+    // 实际上对方还在全速传。
+    const active = p.active === true;
     const who = [p.client_name, p.client_ip].filter(Boolean).join(' / ');
+    const state = active
+      ? (mine ? '上传中 · 正在传输（可在电脑端或这里暂停）' : '其它设备上传中')
+      : (mine ? '未完成 · 已暂停' : '其它设备的任务 · 只读');
     return '<div class="row">'
       + '<div class="hd"><span class="nm">' + esc(p.name) + '</span>'
       + '<span class="pct">' + pctTxt + '%</span></div>'
       + '<div class="sz">已传 ' + fmt(p.offset) + ' / ' + fmt(p.size)
       + (who ? '　来自 ' + esc(who) : '') + '</div>'
       + '<div class="bar"><i style="width:' + pctTxt + '%"></i></div>'
-      + '<div class="st err">' + (mine ? '未完成 · 已暂停' : '其它设备的任务 · 只读') + '</div>'
+      + '<div class="st' + (active ? ' ok' : ' err') + '">' + state + '</div>'
       + '<div class="ops">'
-      + '<button class="mini" data-a="resume" data-u="' + p.uid + '"'
-      + ' data-n="' + esc(p.name) + '" data-s="' + p.size + '"'
-      + (mine ? '' : ' disabled') + '>继续</button>'
+      + (active
+          ? '<button class="mini" data-a="pause" data-u="' + p.uid + '"'
+            + (mine ? '' : ' disabled') + '>暂停</button>'
+          : '<button class="mini" data-a="resume" data-u="' + p.uid + '"'
+            + ' data-n="' + esc(p.name) + '" data-s="' + p.size + '"'
+            + (mine ? '' : ' disabled') + '>继续</button>')
       + '<button class="mini" data-a="drop" data-u="' + p.uid + '"'
       + (mine ? '' : ' disabled') + '>删除</button>'
       + '</div>'
@@ -1609,6 +1736,16 @@ async function refreshPending(){
         }
         toast('已删除该未完成任务');
         refreshPending();
+      } else if (btn.dataset.a === 'pause') {
+        if (btn.disabled) { toast('只能操作自己设备发起的任务'); return; }
+        // TUS 没有服务端强制暂停：登记后由对方下一次心跳收到 paused=true 自行停下
+        const r = await apiFetch('/api/pause/' + btn.dataset.u, {method: 'POST'});
+        if (!r.ok) {
+          toast(r.detail || ('暂停失败（HTTP ' + r.status + '）'));
+          return;
+        }
+        toast('已请求暂停，对方下次心跳即生效');
+        refreshPending();
       } else if (btn.dataset.a === 'resume') {
         if (btn.disabled) { toast('只能续传自己设备发起的任务'); return; }
         resumePendingTask(btn.dataset.u, btn.dataset.n, Number(btn.dataset.s));
@@ -1624,9 +1761,10 @@ function renderTips(){
     ? '分片上传 · 支持断点续传 · 选择后本机可免重选直接续传'
     : '分片上传 · 支持断点续传 · 可随时暂停继续（多选）';
   const pt = document.getElementById('pendingTip');
-  if (pt) pt.innerHTML = FSA_OK
-    ? '点「继续」将<b>自动读取原文件</b>并从断点接着传（浏览器授权后生效）'
-    : '点「继续」后需选中<b>同一个文件</b>以续传；手机通过局域网 IP 访问时浏览器禁止网页自动读取本地文件（安全限制）';
+  if (pt) pt.innerHTML = '仍在传输的显示「上传中」，可直接暂停；残留的显示「已暂停」，'
+    + (FSA_OK
+        ? '点「继续」将<b>自动读取原文件</b>并从断点接着传'
+        : '点「继续」后需选中<b>同一个文件</b>以续传（手机经局域网 IP 访问时浏览器禁止网页读取本地文件）');
 }
 
 const pick = document.getElementById('pick'), box2 = document.getElementById('box');
@@ -1773,6 +1911,7 @@ function buildSpeedBox(){
     });
     if (!r.ok) { toast(r.detail || '限速设置失败'); applySpeedSelect(); return; }
     speedLimit = value;
+    reapplySpeedToTasks();        // 立即让正在传的任务套用新限速与分片
     toast(value ? '上传限速已设为 ' + (value / 1048576) + ' MB/s' : '已取消上传限速');
   };
   applySpeedSelect();
@@ -1921,6 +2060,12 @@ def create_app() -> FastAPI:
                         {"detail": "只能续传自己上传的任务"
                                    f"（该任务来自 {CLIENT_MAP.get(uid, '')}）"},
                         status_code=403)
+                if request.method == "PATCH" and is_dropped(uid):
+                    # 该任务是被**主动删除**的（本机窗口或网页端点的删除）。
+                    # 回 410 而不是让它退回 404：客户端对 404 的处理是"任务丢了、
+                    # 重建后从头传"，那会让刚删掉的任务在服务端重新长出来。
+                    return JSONResponse(
+                        {"detail": "该上传任务已被删除"}, status_code=410)
             response = await call_next(request)
             if request.method == "POST" and "/api/upload" in request.url.path:
                 location = response.headers.get("location") or ""
@@ -2061,7 +2206,7 @@ def create_app() -> FastAPI:
 
     @app.get("/api/settings")
     async def api_settings():
-        """当前并行任务上限与上传限速（程序端与网页端共用）。
+        """当前并行任务上限、上传限速、启动时是否自动打开网页。
 
         网页端每 2 秒轮询本接口：并行数变小就把超出名额的任务转成「排队中」；
         限速改变则立即用于后续分片请求。
@@ -2071,11 +2216,12 @@ def create_app() -> FastAPI:
             "limit": PARALLEL_LIMIT_MAX,
             "speed_limit": SPEED_LIMIT["value"],   # 字节/秒，0 = 无限制
             "speed_min": SPEED_LIMIT_MIN,          # 非 0 时的最小限速
+            "open_browser": AUTO_OPEN_BROWSER["value"],   # 启动时自动打开网页
         }
 
     @app.post("/api/settings")
     async def api_set_settings(request: Request):
-        """修改并行任务上限 / 上传限速，只处理请求里出现的字段，立即持久化。"""
+        """修改并行任务上限 / 上传限速 / 启动时打开网页，出现的字段才处理，立即持久化。"""
         try:
             payload = await request.json()
         except (ValueError, TypeError):
@@ -2110,15 +2256,25 @@ def create_app() -> FastAPI:
             SPEED_LIMIT["value"] = limit
             updated.append("speed_limit")
 
+        if "open_browser" in payload:
+            value = payload["open_browser"]
+            # 只接受真正的布尔值：bool("false") is True，宽松判断会静默设反
+            if not isinstance(value, bool):
+                raise HTTPException(status_code=400, detail="open_browser 必须是布尔值")
+            AUTO_OPEN_BROWSER["value"] = value
+            updated.append("open_browser")
+
         if not updated:
             raise HTTPException(
                 status_code=400,
-                detail="请求里没有可更新的字段（max_parallel / speed_limit）")
+                detail="请求里没有可更新的字段"
+                       "（max_parallel / speed_limit / open_browser）")
 
         await asyncio.to_thread(save_settings)
         return {"ok": True, "updated": updated,
                 "max_parallel": PARALLEL["value"],
-                "speed_limit": SPEED_LIMIT["value"]}
+                "speed_limit": SPEED_LIMIT["value"],
+                "open_browser": AUTO_OPEN_BROWSER["value"]}
 
     @app.get("/api/space")
     async def api_space():

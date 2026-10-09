@@ -28,8 +28,8 @@ runtime.ensure_runtime(__file__)
 import qrcode  # noqa: E402
 import uvicorn  # noqa: E402
 from netutils import find_free_port, get_lan_ip, list_lan_ips  # noqa: E402
-from store import (LOG_DIR, LOG_MAX_BYTES, LOG_PATH,  # noqa: E402
-                   UPLOAD_DIR, create_app, disk_free, human_size)
+from store import (AUTO_OPEN_BROWSER, LOG_DIR, LOG_MAX_BYTES,  # noqa: E402
+                   LOG_PATH, UPLOAD_DIR, create_app, disk_free, human_size)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # 打包成 exe 后 __file__ 指向临时解压目录，必须改用 exe 所在目录
@@ -39,6 +39,10 @@ if getattr(sys, "frozen", False):
 QR_PATH = os.path.join(BASE_DIR, "lan_qrcode.png")
 SERVER_IP = "127.0.0.1"   # 启动后写入真实内网 IP
 SERVER_PORT = 8000        # 启动后写入真实端口
+
+# 默认监听端口：固定下来，这样每次启动的访问地址都一样，手机端存的链接/书签不会失效。
+# 被占用时自动顺延（见 netutils.find_free_port）；用 --port 显式指定则不再顺延。
+DEFAULT_PORT = 17777
 
 # 上传限速下拉可选值（MB/s），0 = 无限制；与网页端的 SPEED_CHOICES 保持一致
 SPEED_CHOICES_MB = (0, 1, 2, 5, 10, 20, 50, 100)
@@ -125,6 +129,29 @@ def print_qrcode_text(url: str):
         pass
 
 
+def filter_new_files(paths, busy_paths):
+    """挑出需要新建上传任务的文件，跳过**同一个绝对路径已经建过任务**的。
+
+    为什么按绝对路径而不是文件名：不同文件夹里的同名文件是两个不同的文件，
+    必须都能上传（服务端落盘时会加 (1)(2) 区分）；真正重复的只有"同一个路径"。
+    同一个文件建两个任务，两个线程会各建一个服务端任务、白传一遍并多出一个
+    副本，所以在这一层就掐掉。
+
+    ``busy_paths`` 是本窗口任务列表里那些**还没结束**的文件的绝对路径集合。
+    已经上传过的（服务端已有记录）不在这里判断——那种情况由服务端按源路径
+    直接拒绝，任务行会显示失败原因（见 store.pre_create_hook）。
+
+    返回 (可上传的路径列表, 被跳过的文件名列表)。
+    """
+    keep, skipped = [], []
+    for path in paths:
+        if os.path.abspath(path) in busy_paths:
+            skipped.append(os.path.basename(path))
+        else:
+            keep.append(path)
+    return keep, skipped
+
+
 def sync_treeview(tree, rows) -> None:
     """把 Treeview 内容增量同步为 rows（[(iid, values), ...]），保持顺序与选中状态。
 
@@ -195,24 +222,54 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
 
     root = tk.Tk()
     root.title("局域网文件传输工具 - 电脑端")
-    root.geometry("900x890")
+    # 默认窗口大小：**客户区** 695x780（按用户截图量得——截图与逻辑像素
+    # 1:1，二维码正好 150px 可当标尺）。
+    # 不能只写 geometry("695x780")：Tk 在 Windows 上按外框折算宽度时会少算
+    # 一段（本机实测 geometry 695 → 客户区只有 683），所以先给目标值，
+    # 等窗口映射出来量一次真实客户区、再按差值补正一次（换 DPI 也准）。
+    WANT_W, WANT_H = 695, 780
+    root.geometry(f"{WANT_W}x{WANT_H}")
     root.configure(bg="#0f1220")
     machine = local_machine_info()
 
     # ---------------------------------------------------------- 顶部信息
-    tk.Label(root, text="局域网文件传输工具", bg="#0f1220", fg="#eef1ff",
-             font=("微软雅黑", 14, "bold")).pack(pady=(10, 2))
-    tk.Label(root, text=f"手机与电脑连同一 WiFi，扫码访问：{url}",
-             bg="#0f1220", fg="#9aa3c7", font=("微软雅黑", 9)).pack()
-    tk.Label(root,
-             text=f"本机：{machine['name']}    IP：{url.split('//')[1].split(':')[0]}"
-                  f"    MAC：{machine['mac'] or '未知'}",
-             bg="#0f1220", fg="#9aa3c7", font=("微软雅黑", 9)).pack(pady=(2, 4))
+    # 文字靠左、二维码靠右并排：比上下堆叠少占约一半纵向空间。
+    # pack 顺序有讲究——先放右边的二维码占住宽度，剩下的自动留给文字。
+    head = tk.Frame(root, bg="#0f1220")
+    head.pack(fill="x", padx=14, pady=(10, 6))
+    lan_ip = url.split("//", 1)[-1].split(":", 1)[0]
 
-    img = Image.open(qr_path)
-    img = img.resize((160, 160), Image.LANCZOS)
+    img = Image.open(qr_path).resize((150, 150), Image.LANCZOS)
     photo = ImageTk.PhotoImage(img)
-    tk.Label(root, image=photo, bg="white", bd=0).pack(pady=2)
+    qr_label = tk.Label(head, image=photo, bg="white", bd=0)
+    qr_label.image = photo          # 显式持有引用，避免被回收成空白
+    qr_label.pack(side="right")
+
+    info = tk.Frame(head, bg="#0f1220")
+    info.pack(side="left", fill="both", expand=True, padx=(0, 14))
+    # 上下各塞一个可伸缩的空框，把文字块在二维码的高度里垂直居中
+    tk.Frame(info, bg="#0f1220").pack(expand=True)
+    tk.Label(info, text="局域网文件传输工具", bg="#0f1220", fg="#eef1ff",
+             font=("微软雅黑", 14, "bold")).pack(anchor="w")
+    tk.Label(info, text="手机与电脑连同一WiFi，扫码访问：", bg="#0f1220",
+             fg="#9aa3c7", font=("微软雅黑", 9)).pack(anchor="w", pady=(8, 0))
+    # 访问地址本身就是「在电脑上打开网页」的入口：下划线 + 手型光标 + 悬停变色，
+    # 右侧小字写明可以点——否则用户不知道这里能点。
+    link_row = tk.Frame(info, bg="#0f1220")
+    link_row.pack(anchor="w", pady=(2, 0))
+    link = tk.Label(link_row, text=url, bg="#0f1220", fg="#8fb0ff",
+                    font=("Consolas", 11, "bold", "underline"), cursor="hand2")
+    link.pack(side="left")
+    tk.Label(link_row, text="（点击此行在电脑上打开网页）", bg="#0f1220",
+             fg="#6f78a0", font=("微软雅黑", 9)).pack(side="left", padx=(6, 0))
+    link.bind("<Button-1>", lambda _e: webbrowser.open(url))
+    link.bind("<Enter>", lambda _e: link.configure(fg="#cfdcff"))
+    link.bind("<Leave>", lambda _e: link.configure(fg="#8fb0ff"))
+    tk.Label(info, text=f"本机：{machine['name']}    IP：{lan_ip}", bg="#0f1220",
+             fg="#9aa3c7", font=("微软雅黑", 9)).pack(anchor="w", pady=(8, 0))
+    tk.Label(info, text=f"MAC：{machine['mac'] or '未知'}", bg="#0f1220",
+             fg="#9aa3c7", font=("微软雅黑", 9)).pack(anchor="w")
+    tk.Frame(info, bg="#0f1220").pack(expand=True)
 
     # ---------------------------------------------------------- 已接收文件
     tk.Label(root, text="已接收文件（Ctrl / Shift 可多选，按 Delete 删除记录；右键：下载 / 删除）",
@@ -225,8 +282,12 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
     # selectmode="extended"：支持 Ctrl / Shift 多选，配合 Delete 键批量删记录
     tree = ttk.Treeview(frame, columns=cols, show="headings", height=8,
                         selectmode="extended")
-    headers = (("文件名", 175), ("大小", 80), ("状态", 105), ("接收时间", 100),
-               ("IP地址", 100), ("计算机名", 100), ("MAC地址", 120))
+    # 列宽合计必须放得下默认窗口下的表格宽度（客户区 695 → 可用约 652px）。
+    # 原来合计 780px 超了，Tk 会把最后一列直接裁掉，而表格没有横向滚动条
+    # ——「MAC地址」等于完全看不到。这里按原比例缩到 640 留点余量；
+    # 窗口拉宽时 Tk 会按比例把列一起拉伸。
+    headers = (("文件名", 144), ("大小", 66), ("状态", 86), ("接收时间", 82),
+               ("IP地址", 82), ("计算机名", 82), ("MAC地址", 98))
     for col, (title, width) in zip(cols, headers):
         tree.heading(col, text=title)
         tree.column(col, width=width, anchor="w")
@@ -595,6 +656,24 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
     speed_box.pack(side="left", padx=(6, 0))
     speed_box.bind("<<ComboboxSelected>>", lambda _e: on_speed_change())
 
+    def on_auto_browser_change():
+        """「启动时自动打开网页」勾选框：写回服务端并持久化，下次启动生效。"""
+        value = bool(auto_var.get())
+        ok, msg = api_call("POST", "/api/settings", {"open_browser": value})
+        if not ok:
+            status_var.set(f"⚠ 自动打开网页的设置未能保存：{msg}")
+            return
+        status_var.set("已设为每次启动自动打开网页（下次启动生效）" if value
+                       else "已设为启动时不自动打开网页（下次启动生效）")
+
+    auto_var = tk.BooleanVar(value=AUTO_OPEN_BROWSER["value"])
+    tk.Checkbutton(up_opts, text="启动时自动打开网页", variable=auto_var,
+                   command=on_auto_browser_change, bg="#0f1220", fg="#9aa3c7",
+                   activebackground="#0f1220", activeforeground="#eef1ff",
+                   selectcolor="#262c4a", font=("微软雅黑", 9),
+                   highlightthickness=0, bd=0,
+                   anchor="w").pack(side="right")
+
     up_frame = ttk.Frame(root)
     up_frame.pack(fill="x", padx=14)
     up_tree = ttk.Treeview(up_frame, columns=("name", "size", "pct", "speed", "state"),
@@ -705,7 +784,7 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
         speed["value"] = value
         ok, msg = api_call("POST", "/api/settings", {"speed_limit": value})
         for rec in tasks.values():
-            rec["task"].limit_bps = value
+            rec["task"].set_limit(value)      # 改了限速立刻重置发送循环的时间基准
         status_var.set(f"上传限速已设为 {speed_box.get()}，网页端会自动同步"
                        if ok else f"⚠ 上传限速未能同步到服务端：{msg}")
 
@@ -728,7 +807,7 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
         if limit != speed["value"]:
             speed["value"] = limit
             for rec in tasks.values():
-                rec["task"].limit_bps = limit
+                rec["task"].set_limit(limit)   # 改了限速立刻重置发送循环的时间基准
             label = next((lbl for lbl, val in speed_by_label.items()
                           if val == limit), None)
             if label is None:
@@ -741,7 +820,7 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
     def add_task(path: str, state: str = "waiting", uploaded: int = 0, iid: str = ""):
         """新建（或恢复）一个本机上传任务；传入 iid 表示复用原行，不新增条目。"""
         task = UploadTask(path, port)
-        task.limit_bps = speed["value"]      # 新建任务沿用当前的限速设置
+        task.set_limit(speed["value"])        # 新建任务沿用当前的限速设置
         iid = iid or task.iid
         try:
             mtime = os.path.getmtime(path)
@@ -921,9 +1000,32 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
                 "speed": "-", "state": "已中断（文件不存在）"})
 
     def pick_files():
-        for path in filedialog.askopenfilenames(title="选择要上传的文件"):
+        """选择本机要上传的文件。
+
+        这里只掐「同一个绝对路径已经建过任务」的情况（同一文件传两遍没意义）。
+        「这个文件之前已经传过」由服务端按源文件绝对路径判定：判重键是绝对
+        路径，所以不同文件夹里的同名文件都能传（落盘时自动加 (1)(2)），
+        只有同一路径才会被判为重复——那时任务行会显示失败原因。
+        """
+        picked = filedialog.askopenfilenames(title="选择要上传的文件")
+        if not picked:
+            return
+        busy = {rec["task"].src_path for rec in tasks.values()
+                if rec["state"] not in ("done", "failed", "canceled")}
+        added, skipped = filter_new_files(picked, busy)
+        for path in added:
             add_task(path)
         pump_local()          # 按并行上限放行，超出的显示「排队中」
+        if skipped:
+            shown = "、".join(skipped[:5]) + ("…" if len(skipped) > 5 else "")
+            status_var.set(f"已跳过 {len(skipped)} 个文件（{shown}）："
+                           f"同样的路径已在下面的任务列表中")
+        if not added:
+            messagebox.showinfo(
+                "没有可上传的文件",
+                "选中的文件都已在任务列表中：\n\n"
+                + "\n".join(skipped[:8])
+                + ("\n…" if len(skipped) > 8 else ""))
 
     def start_selected():
         """「开始/继续」：选中项回到队列，由调度器按名额启动。"""
@@ -943,15 +1045,35 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
         for iid in up_tree.selection():
             delete_task(iid)
     # ---------------------------------------------------------- 未完成任务提示
-    # include_active=True：正在传输中的任务也要列出来，否则只查"已停止"的
-    # 那些，会出现任务在两个列表里都查不到的错觉
-    pending = scan_pending_uploads(include_active=True)
-    if pending:
+    # ---------------------------------------------------------- 未完成任务提示
+    # 这一行必须随列表一起刷新：早期只在启动时渲染一次，任务删掉之后
+    # 这里还挂着旧文件名，看着像"删了没生效"。
+    pending_var = tk.StringVar(value="")
+    tk.Label(root, textvariable=pending_var, bg="#3a2f14", fg="#ffcc66",
+             font=("微软雅黑", 9), wraplength=850, justify="left").pack(
+        fill="x", padx=14, pady=(6, 0))
+
+    def refresh_pending_hint():
+        """刷新「未完成的上传」提示。
+
+        include_active=True：正在传输中的任务也要列出来，否则只查"已停止"
+        的那些，会出现任务在两个列表里都查不到的错觉；
+        with_device=False：跳过客户端 IP 反查（可能阻塞数秒，不能放进
+        Tk 主线程的 2 秒定时器里）。
+        """
+        try:
+            items = scan_pending_uploads(include_active=True, with_device=False)
+        except Exception as exc:
+            report_gui_error(f"刷新未完成任务提示失败：{exc}")
+            return
+        if not items:
+            pending_var.set("")
+            return
         names = "、".join(f"{p['name']} {pct_text(p['offset'], p['size'])}"
-                          for p in pending)
-        tk.Label(root, text=f"共 {len(pending)} 个未完成的上传（网页端或本机可继续）：{names}",
-                 bg="#3a2f14", fg="#ffcc66", font=("微软雅黑", 9),
-                 wraplength=850, justify="left").pack(fill="x", padx=14, pady=(6, 0))
+                          for p in items[:6])
+        pending_var.set(f"共 {len(items)} 个未完成的上传"
+                        f"（网页端或本机可继续）：{names}"
+                        + (f" 等 {len(items)} 个" if len(items) > 6 else ""))
 
     # ---------------------------------------------------------- 底部按钮
     # 界面异常提示条（刷新出错、上传失败等会在这里显示，不再静默吞掉）
@@ -992,7 +1114,7 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
     ttk.Button(bar, text="暂停", command=pause_selected).pack(side="left", padx=4)
     ttk.Button(bar, text="取消/删除", command=cancel_selected).pack(side="left", padx=4)
     ttk.Button(bar, text="刷新列表", command=refresh_tree).pack(side="left", padx=4)
-    ttk.Button(bar, text="打开网页", command=lambda: webbrowser.open(url)).pack(side="left", padx=4)
+    # 「打开网页」按钮已去掉：顶部那行访问地址本身就是入口（见上面 link 的绑定）
     ttk.Button(bar, text="打开文件夹", command=open_upload_dir).pack(side="left", padx=4)
     # 「退出」必须走完整关闭流程（确认弹窗 + 暂停任务 + 持久化），
     # 直接 root.destroy() 会跳过全部收尾动作
@@ -1034,6 +1156,7 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
         try:
             refresh_tree()
             sync_settings_from_server()
+            refresh_pending_hint()
         except Exception as exc:
             report_gui_error(f"刷新界面失败：{exc}")
         finally:
@@ -1043,8 +1166,26 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
         refresh_tree()
     except Exception as exc:
         report_gui_error(f"首次读取文件列表失败：{exc}")
-    root.after(500, tick)
-    root.mainloop()
+
+    # 把客户区精确调成目标尺寸：先让窗口真正映射出来（update_idletasks 只排
+    # 布局，不映射），再按实测差值补一次（见上面 WANT_W/WANT_H 的说明）。
+    #
+    # 整段用 try 包住：窗口若在构建期间就被关掉（脚本化操作、或用户手快），
+    # update() 会把关闭消息处理掉并把 root 销毁，后面的 winfo_width / after
+    # 就会抛 TclError。那属于"窗口被正常关掉"，不是"图形窗口启动失败"——
+    # 放任它冒泡出去，上层会回退到"无窗口时死循环等服务"，而 exe 没有控制台，
+    # 进程就变成一个只能去任务管理器结束的僵尸进程（实测踩到过）。
+    try:
+        root.update_idletasks()
+        root.update()
+        dw = WANT_W - root.winfo_width()
+        dh = WANT_H - root.winfo_height()
+        if dw or dh:
+            root.geometry(f"{WANT_W + dw}x{WANT_H + dh}")
+        root.after(500, tick)
+        root.mainloop()
+    except tk.TclError:
+        pass
 
 
 def main() -> None:
@@ -1061,15 +1202,26 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="局域网文件传输工具（TUS 分片上传）")
     parser.add_argument("--host", default="0.0.0.0", help="监听地址，默认 0.0.0.0（所有网卡）")
-    parser.add_argument("--port", type=int, default=0, help="端口，0 = 随机分配空闲端口")
+    parser.add_argument("--port", type=int, default=None,
+                        help=f"固定端口，默认 {DEFAULT_PORT}（被占用时自动顺延）；"
+                             f"填 0 = 随机分配")
     parser.add_argument("--no-gui", action="store_true", help="不打开窗口，仅控制台输出二维码")
-    parser.add_argument("--no-browser", action="store_true", help="启动时不自动打开浏览器")
+    # 是否自动打开浏览器：默认取设置文件里的开关（默认关闭），
+    # 下面两个参数只覆盖「本次启动」，不改设置。
+    web = parser.add_mutually_exclusive_group()
+    web.add_argument("--browser", dest="browser", action="store_const", const=True,
+                     default=None, help="本次启动自动打开浏览器（只对本次有效）")
+    web.add_argument("--no-browser", dest="browser", action="store_const", const=False,
+                     help="本次启动不打开浏览器（只对本次有效）")
     args = parser.parse_args()
 
     global app
     app = create_app()  # 创建目录并装配 TUS 路由
 
-    SERVER_PORT = find_free_port(args.port)
+    # 未指定 --port：默认端口被占用就顺延（保证一定起得来）
+    # 显式指定 --port：严格按该端口，占用则报错退出（用户点名要的就是它）
+    SERVER_PORT = find_free_port(DEFAULT_PORT if args.port is None else args.port,
+                                 strict=args.port is not None, host=args.host)
     SERVER_IP = get_lan_ip()
     url = f"http://{SERVER_IP}:{SERVER_PORT}"
     qr_path = make_qrcode(url)
@@ -1084,6 +1236,9 @@ def main() -> None:
     others = [ip for ip in list_lan_ips() if ip != SERVER_IP]
     if others:
         print(f"  其它网卡 IP: {', '.join(others)}")
+    # 命令行显式指定优先，否则用设置里的开关（默认不自动打开）
+    auto_open = AUTO_OPEN_BROWSER["value"] if args.browser is None else args.browser
+    print(f"  打开浏览器 : {'是' if auto_open else '否（点窗口里的访问地址即可打开）'}")
     print("-" * 60)
     if args.no_gui:
         print()
@@ -1094,9 +1249,14 @@ def main() -> None:
     server, thread = start_server(args.host, SERVER_PORT)
     time.sleep(0.8)
     if not getattr(server, "started", False):
+        # 端口没绑上：横幅里的地址、二维码全是假的，窗口开着也传不了文件。
+        # 原先是打个错误就继续跑（无窗口模式会一直空转），会让人以为服务是好的。
         print(f"[错误] 服务启动失败，端口可能被占用：{args.host}:{SERVER_PORT}")
+        print("       请关闭占用该端口的程序后重试，或用 --port 指定其它端口。")
+        raise SystemExit(1)
 
-    if not args.no_browser:
+    # 服务已就绪，这时再打开浏览器，避免落在还没监听的端口上
+    if auto_open:
         threading.Thread(target=lambda: webbrowser.open(url), daemon=True).start()
 
     gui_ok = False
@@ -1108,6 +1268,15 @@ def main() -> None:
             print(f"[提示] 无法启动图形窗口（{exc}），已切换为控制台模式。")
             print_qrcode_text(url)
     if not gui_ok:
+        # 这里的死循环是给「无窗口模式」维持服务用的，靠 Ctrl+C 退出。
+        # 但打包成 exe 是 --noconsole：窗口没起来时既没有窗口也没有控制台，
+        # 再死循环就变成一个没有任何提示、只能在任务管理器里结束的僵尸进程
+        # （实测：界面还没建完就被关掉时走到过这里）。此时直接报错退出。
+        if not args.no_gui and getattr(sys, "frozen", False):
+            print("[错误] 图形窗口未能启动，且当前没有控制台可退出。"
+                  "请查看上面的报错信息后重试。")
+            raise SystemExit(1)
+        print("  按 Ctrl+C 停止服务。")
         try:
             while True:
                 time.sleep(1)

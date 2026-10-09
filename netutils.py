@@ -100,25 +100,48 @@ def get_lan_ip() -> str:
     return ips[0] if ips else "127.0.0.1"
 
 
-def is_port_free(port: int) -> bool:
-    """判断端口能否被本程序占用。"""
+def is_port_free(port: int, host: str = "0.0.0.0") -> bool:
+    """判断 port 能否绑在 host 上（默认 0.0.0.0，与服务默认监听一致）。
+
+    必须按服务**真正要绑定的地址**来判断：Windows 允许同一个端口分别被
+    ``127.0.0.1:P`` 和 ``0.0.0.0:P`` 两个 socket 占住，所以拿 0.0.0.0 去探测
+    一个只绑 127.0.0.1 的同端口服务会误报「空闲」，于是选中一个绑不上的端口。
+    """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         try:
-            sock.bind(("0.0.0.0", port))
+            sock.bind((host, port))
             return True
         except OSError:
             return False
 
 
-def find_free_port(preferred: int = 0) -> int:
-    """自动分配端口：指定端口被占用则报错；未指定则随机挑选空闲端口。"""
+def find_free_port(preferred: int = 0, strict: bool = False,
+                   host: str = "0.0.0.0") -> int:
+    """挑选监听端口。
+
+    preferred=0        -> 随机空闲端口（20000~60000）
+    preferred 未被占用   -> 直接用这个端口
+    preferred 已被占用   -> strict=True 时直接报错退出（用户点名要这个端口）；
+                          否则在它之后顺延试 20 个端口，并打印提示。
+
+    为什么要顺延而不是直接退出：默认端口（17777）是「希望固定」而非「必须固定」。
+    上一个实例没退干净、或别的程序临时占了它，都不该让程序完全打不开——
+    顺延后的端口会写进横幅、二维码和窗口，用户看到的仍是真实地址。
+    """
     if preferred:
-        if is_port_free(preferred):
+        if is_port_free(preferred, host):
             return preferred
-        raise SystemExit("[错误] 端口已被占用，请换一个或去掉 --port 参数。")
+        if strict:
+            raise SystemExit(
+                f"[错误] 端口 {preferred} 已被占用，请换一个或去掉 --port 参数。")
+        for offset in range(1, 21):
+            candidate = preferred + offset
+            if is_port_free(candidate, host):
+                print(f"[提示] 端口 {preferred} 已被占用，已自动改用 {candidate}。")
+                return candidate
     for _ in range(300):
         port = random.randint(20000, 60000)
-        if is_port_free(port):
+        if is_port_free(port, host):
             return port
     sock = socket.socket()
     sock.bind(("", 0))

@@ -28,10 +28,15 @@ class UploadTask:
     def __init__(self, path: str, port: int, chunk_size: int = 32 * 1024 * 1024):
         self.path = path
         self.name = os.path.basename(path)
+        # 源文件绝对路径：服务端据此判重（同一路径再次上传直接失败）。
+        # 必须用**绝对路径**而不是文件名——不同文件夹里的同名文件是两个不同的
+        # 文件，都要能传；真正重复的只有"同一个路径"。
+        self.src_path = os.path.abspath(path)
         self.size = os.path.getsize(path)
         self.port = port
         self.chunk_size = chunk_size
         self.limit_bps = 0             # 上传限速（字节/秒）；0 = 不限制
+        self._rate_reset = False       # 限速值变过：发送循环据此重置时间基准
         self.status = "paused"        # 初始暂停，点"开始"才上传
         self.uploaded = 0              # 已传字节（续传时从服务端 offset 起算）
         self.speed = 0.0               # MB/s
@@ -58,10 +63,22 @@ class UploadTask:
 
         tuspyserver 在 HEAD（断点续传第一步）时会校验这两个字段，
         缺 filetype 会直接返回 400，导致续传退化成重新上传。
+
+        ``local MQ==`` 是本上传器给自己的任务打的标记（MQ== 即 "1"，
+        对应 store.LOCAL_UPLOADER_KEY）。服务端据此把"程序端发起的上传"
+        与"本机浏览器发起的上传"区分开——两者来源 IP 都是 127.0.0.1，
+        只按 IP 判断会让本上传器认领浏览器的任务，形成两个写入者
+        （锁文件争用 / Error removing lock file）。
+
+        ``srcpath`` 带上源文件绝对路径（对应 store.SRC_PATH_KEY）：
+        服务端用它判重——同一个路径再次上传会被拒绝（409），
+        而不同文件夹里的同名文件（路径不同）照常能传。
         """
         name_b64 = base64.b64encode(self.name.encode("utf-8")).decode()
         type_b64 = base64.b64encode(b"application/octet-stream").decode()
-        return f"filename {name_b64},filetype {type_b64}"
+        path_b64 = base64.b64encode(self.src_path.encode("utf-8")).decode()
+        return (f"filename {name_b64},filetype {type_b64},"
+                f"local MQ==,srcpath {path_b64}")
 
     def _request(self, method: str, path: str, body=None, headers=None, timeout=60):
         """发一个短连接 HTTP 请求。
@@ -84,7 +101,7 @@ class UploadTask:
                 pass
 
     def _find_existing(self):
-        """在服务端"未完成任务"中查找**本机发起的**同名同大小任务。
+        """在服务端"未完成任务"中查找**本上传器自己发起**的同名同大小任务。
 
         这是跨进程 / 跨程序重启断点续传的关键：程序被强杀后，原来的
         UploadTask 对象已不存在，新对象靠文件名 + 大小找回服务端残留的
@@ -94,9 +111,12 @@ class UploadTask:
           1) 带 ``include_active=1``：暂停后服务端的心跳标记可能尚未过期，
              若只查"未在传输"的任务就会查不到，于是新建任务、已传字节作废，
              还会多出一个「文件名(1)」副本；
-          2) 只匹配 ``local_task=true``（任务由本机任一地址创建）：避免把
-             别的设备上传的同名同大小任务当成自己的断点续写，造成两台设备
-             的数据互相覆盖。
+          2) 只匹配 ``local_uploader=true``（由本上传器创建的任务，
+             见 ``_meta_header`` 里带的 ``local`` 标记）：浏览器发起的上传
+             来源 IP 也是 127.0.0.1，若按"本机任务"认领，就会去续写**别人
+             正在写的那个任务**——两个写入者同时往同一个 TUS 资源追加，
+             服务端锁文件被抢（Error removing lock file / WinError 32），
+             同名不同内容时还会把文件写坏。别人的任务交回给发起方续传。
         """
         try:
             # 统一走 http.client：urllib 的连接复用在部分场景会被服务端提前
@@ -112,10 +132,10 @@ class UploadTask:
                     continue
                 if int(item.get("size") or 0) != self.size:
                     continue
-                if item.get("local_task") is not True:
-                    continue          # 别的设备的任务：绝不续写
+                if item.get("local_uploader") is not True:
+                    continue          # 不是本上传器发起的：绝不续写
                 if best is None or int(item.get("offset") or 0) > int(best.get("offset") or 0):
-                    best = item        # 同机多个残留时取进度最靠前的
+                    best = item        # 多个残留时取进度最靠前的
             return best
         except Exception:
             pass
@@ -126,13 +146,28 @@ class UploadTask:
         self.upload_url = f"http://127.0.0.1:{self.port}/api/upload/{uid}"
         self._path = f"/api/upload/{uid}"
 
+    @staticmethod
+    def _create_error(status: int, body: bytes) -> str:
+        """把服务端拒绝的原因原样交给用户。
+
+        服务端在创建阶段就会拒绝：409（该源路径已上传过）、507（磁盘不足）。
+        早期这里固定写"磁盘空间可能不足"，用户看不到真正的原因——现在优先
+        取响应体里的 detail。
+        """
+        try:
+            detail = json.loads(body.decode("utf-8")).get("detail")
+        except (ValueError, AttributeError, UnicodeDecodeError):
+            detail = ""
+        return str(detail) if detail else f"创建上传失败（HTTP {status}）"
+
     def _create_upload(self):
         """创建 TUS 上传，返回资源地址。"""
-        status, headers, _ = self._request("POST", "/api/upload/", body=b"",
+        status, headers, body = self._request(
+            "POST", "/api/upload/", body=b"",
             headers=self._headers({"Upload-Length": str(self.size),
                                    "Upload-Metadata": self._meta_header()}))
         if status not in (200, 201):
-            raise RuntimeError(f"创建上传失败（HTTP {status}），磁盘空间可能不足")
+            raise RuntimeError(self._create_error(status, body))
         loc = headers.get("location") or headers.get("Location") or ""
         if not loc:
             raise RuntimeError("服务端未返回上传地址")
@@ -186,6 +221,19 @@ class UploadTask:
         return url.rstrip("/").rsplit("/", 1)[-1] if url else ""
 
     # -------- 限速 --------
+    def set_limit(self, limit_bps: int) -> None:
+        """更新限速并通知发送循环重置时间基准。
+
+        改限速后必须重新计账：否则按旧基准累加，会出现两类毛病——
+        调到更小（如 1 MB/s）时要先"补等"之前全速传的字节、任务长时间
+        卡住像暂停；调到更大（如 10 MB/s）时又因为旧基准下的"欠账"为负，
+        在追平之前一直全速跑，看起来限速失效。
+        """
+        if limit_bps == self.limit_bps:
+            return
+        self.limit_bps = limit_bps
+        self._rate_reset = True
+
     def _chunk_bytes(self) -> int:
         """本次请求发送的字节数：限速时压到约 1 秒的数据量。
 
@@ -203,6 +251,8 @@ class UploadTask:
         "按目标速率最多允许多少时间"，多用的时间就在这里补回来。
         """
         while self.limit_bps:
+            if self._rate_reset:
+                return False           # 基准被重置：交给循环顶部用新基准重算
             used = (self._offset - rate_base) / self.limit_bps
             remain = used - (time.time() - rate_start)
             if remain <= 0 or self._pause.is_set():
@@ -252,14 +302,28 @@ class UploadTask:
         self.start()
 
     def cancel(self):
-        """取消任务，并删除服务端已上传的分片。"""
+        """取消任务，并彻底清掉服务端已上传的分片。
+
+        优先走本程序的 ``/api/pending/{uid}``：它除了删文件，还会登记
+        ``DROP_UIDS`` 拦掉正在飞行中的分片，并在随后的几十秒里反复复查
+        竞态残留。只发 TUS 的 DELETE 时，取消瞬间恰好有个 PATCH 在途，
+        它会在删除之后把任务文件写回来——服务端就留下一个删不掉的空任务，
+        网页端「未完成任务」里一直显示着。
+        """
         self._stop.set()
         self._pause.clear()
         self._unbeat()
         self.status = "canceled"
-        if self.upload_url:
+        uid = self._uid()
+        if uid:
             try:
-                self._request("DELETE", self._path, headers=self._headers({}), timeout=30)
+                code, _headers, _body = self._request(
+                    "DELETE", f"/api/pending/{uid}",
+                    headers=self._headers({}), timeout=30)
+                # 非本机发起的任务走不通上面那个接口（403），退回 TUS 终止扩展
+                if code >= 400 and self._path:
+                    self._request("DELETE", self._path,
+                                  headers=self._headers({}), timeout=30)
             except Exception:
                 pass
         self._notify()
@@ -316,6 +380,10 @@ class UploadTask:
                     if paused_at is not None:
                         # 暂停的这段时间不计入限速基准，否则恢复后会一次性补传
                         rate_start += time.time() - paused_at
+                    if self._rate_reset:
+                        # 限速值变过：从当前字节重新计时，不再按旧基准补等/超额
+                        self._rate_reset = False
+                        rate_start, rate_base = time.time(), self._offset
                     # 文件指针始终对齐到服务端已确认的字节
                     if fp.tell() != self._offset:
                         fp.seek(self._offset)
@@ -328,9 +396,20 @@ class UploadTask:
                             "Upload-Offset": str(self._offset),
                             "Content-Type": "application/offset+octet-stream",
                         }), timeout=300)
-                    if status == 404:
-                        # 服务端这个任务已被删除（过期清理或手动删除）：
-                        # 重建上传后从头传，而不是直接失败
+                    if status in (404, 410):
+                        # 410 = 任务被主动删除（本机窗口或网页端的「删除」）；
+                        # 本任务已被取消 / 停止时同理：一律就此收尾，绝不能重建。
+                        # 重建会在服务端留下一个进度为 0 的空任务，网页端
+                        # 「未完成任务」里会一直挂着一个怎么删都删不掉的条目。
+                        if (status == 410 or self._stop.is_set()
+                                or self.status == "canceled"):
+                            if status == 410 and not self._stop.is_set():
+                                # 被别处（网页端 / 另一个窗口）删了：本地也收尾，
+                                # 界面上显示「已取消」而不是一直挂着"上传中"
+                                self.cancel()
+                            return
+                        # 服务端这个任务不存在了（过期清理等）：重建上传后从头传，
+                        # 而不是直接失败
                         if getattr(self, "_recreated", False):
                             raise RuntimeError("上传任务已在服务端被删除，请重新选择文件")
                         self._recreated = True
@@ -382,6 +461,16 @@ class UploadTask:
                         if reply and reply.get("paused"):
                             self.pause()
                             continue
+                        if (reply and reply.get("alive") is False
+                                and self._offset < self.size):
+                            # 任务已被删除（本机窗口或网页端删的）：立刻收尾，
+                            # 既不继续传，也绝不重建。
+                            # 必须带上"还没传完"这个条件——服务端在**正常完成**时
+                            # 同样会删掉 .info，此时心跳也回 alive=false，不判断
+                            # 就会把刚传完的任务误标成已取消。
+                            print(f"[取消] {self.name} 已被删除，停止上传", flush=True)
+                            self.cancel()
+                            return
                     self._notify()
                     # 限速：按目标速率补足等待，等待期间收到停止信号就直接退出
                     if self._pace(rate_start, rate_base):

@@ -31,6 +31,7 @@ class UploadTask:
         self.size = os.path.getsize(path)
         self.port = port
         self.chunk_size = chunk_size
+        self.limit_bps = 0             # 上传限速（字节/秒）；0 = 不限制
         self.status = "paused"        # 初始暂停，点"开始"才上传
         self.uploaded = 0              # 已传字节（续传时从服务端 offset 起算）
         self.speed = 0.0               # MB/s
@@ -184,6 +185,33 @@ class UploadTask:
         url = self.upload_url or ""
         return url.rstrip("/").rsplit("/", 1)[-1] if url else ""
 
+    # -------- 限速 --------
+    def _chunk_bytes(self) -> int:
+        """本次请求发送的字节数：限速时压到约 1 秒的数据量。
+
+        分片变大只是让限速的颗粒度变粗（发完一大块再长时间等待），
+        压到 1 秒既有平滑的限速效果，暂停/取消也能更快生效。
+        """
+        if not self.limit_bps:
+            return self.chunk_size
+        return min(self.chunk_size, max(64 * 1024, self.limit_bps))
+
+    def _pace(self, rate_start: float, rate_base: int) -> bool:
+        """按限速补足等待时间；返回 True 表示等到一半被要求停止。
+
+        以「本次传输的起始字节 + 起始时刻」为基准，算出到目前为止
+        "按目标速率最多允许多少时间"，多用的时间就在这里补回来。
+        """
+        while self.limit_bps:
+            used = (self._offset - rate_base) / self.limit_bps
+            remain = used - (time.time() - rate_start)
+            if remain <= 0 or self._pause.is_set():
+                return False           # 暂停交给循环顶部的暂停点统一处理
+            if self._stop.is_set():
+                return True
+            time.sleep(min(remain, 0.2))
+        return False
+
     def _notify(self):
         if self.on_progress:
             try:
@@ -274,16 +302,25 @@ class UploadTask:
             with open(self.path, "rb") as fp:
                 fp.seek(self._offset)
                 last_bytes, last_time = self._offset, time.time()
+                # 限速的时间基准：本次传输的起始时刻与起始字节
+                rate_start, rate_base = time.time(), self._offset
                 while self._offset < self.size:
                     # 暂停点：让出线程等待继续
+                    paused_at = None
                     while self._pause.is_set() and not self._stop.is_set():
+                        if paused_at is None:
+                            paused_at = time.time()
                         time.sleep(0.2)
                     if self._stop.is_set():
                         return
+                    if paused_at is not None:
+                        # 暂停的这段时间不计入限速基准，否则恢复后会一次性补传
+                        rate_start += time.time() - paused_at
                     # 文件指针始终对齐到服务端已确认的字节
                     if fp.tell() != self._offset:
                         fp.seek(self._offset)
-                    block = fp.read(min(self.chunk_size, self.size - self._offset))
+                    block = fp.read(min(self._chunk_bytes(),
+                                        self.size - self._offset))
                     if not block:
                         break
                     status, headers, _ = self._request("PATCH", self._path, body=block,
@@ -306,6 +343,7 @@ class UploadTask:
                         self._create_upload()
                         self._offset = self._query_offset()
                         last_bytes, last_time = self._offset, time.time()
+                        rate_start, rate_base = time.time(), self._offset
                         self._notify()
                         continue
                     if status == 409:
@@ -314,6 +352,7 @@ class UploadTask:
                         self._offset = self._query_offset()
                         self.uploaded = self._offset
                         last_bytes, last_time = self._offset, time.time()
+                        rate_start, rate_base = time.time(), self._offset
                         self._notify()
                         continue
                     if status not in (200, 204):
@@ -344,6 +383,9 @@ class UploadTask:
                             self.pause()
                             continue
                     self._notify()
+                    # 限速：按目标速率补足等待，等待期间收到停止信号就直接退出
+                    if self._pace(rate_start, rate_base):
+                        return
             self.status = "done"
             self.speed = 0.0
             self._unbeat()

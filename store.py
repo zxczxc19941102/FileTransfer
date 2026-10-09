@@ -85,6 +85,14 @@ SERVER_PORT = 8000                  # 启动后写入真实端口
 PARALLEL_LIMIT_MAX = 32             # 硬上限，无法通过接口突破
 PARALLEL_LIMIT_DEFAULT = 32         # 默认值
 PARALLEL = {"value": PARALLEL_LIMIT_DEFAULT}
+
+# ---- 上传限速（两端共用）----
+# 单位 字节/秒；0 = 无限制；非 0 时最小 1 MB/s（再小会让请求碎成一片、
+# 且对大文件毫无实用价值）。程序端与网页端各自在自己的发送循环里节流。
+SPEED_LIMIT_MIN = 1 << 20           # 1 MB/s
+SPEED_LIMIT_DEFAULT = 0             # 0 = 无限制
+SPEED_LIMIT = {"value": SPEED_LIMIT_DEFAULT}
+
 SETTINGS_PATH = os.path.join(UPLOAD_DIR, ".settings.json")
 
 # 当前请求的客户端 IP（由 HTTP 中间件在进入业务处理前写入）。
@@ -139,13 +147,22 @@ def open_local_dir(path: str) -> bool:
 
 
 def load_settings():
-    """读取持久化的设置（当前只有并行任务上限），异常时保留默认值。"""
+    """读取持久化的设置（并行任务上限、上传限速），异常时保留默认值。"""
     try:
         with open(SETTINGS_PATH, "r", encoding="utf-8") as fp:
-            value = int(json.load(fp).get("max_parallel"))
-    except (OSError, ValueError, TypeError, AttributeError):
+            data = json.load(fp)
+    except (OSError, ValueError, TypeError):
         return
-    PARALLEL["value"] = max(1, min(PARALLEL_LIMIT_MAX, value))
+    if not isinstance(data, dict):
+        return
+    try:
+        value = int(data.get("max_parallel"))
+        PARALLEL["value"] = max(1, min(PARALLEL_LIMIT_MAX, value))
+    except (TypeError, ValueError):
+        pass
+    limit = data.get("speed_limit")
+    if isinstance(limit, (int, float)) and (limit == 0 or limit >= SPEED_LIMIT_MIN):
+        SPEED_LIMIT["value"] = int(limit)
 
 
 def save_settings():
@@ -153,7 +170,8 @@ def save_settings():
     tmp = SETTINGS_PATH + ".tmp"
     try:
         with open(tmp, "w", encoding="utf-8") as fp:
-            json.dump({"max_parallel": PARALLEL["value"]}, fp)
+            json.dump({"max_parallel": PARALLEL["value"],
+                       "speed_limit": SPEED_LIMIT["value"]}, fp)
         os.replace(tmp, SETTINGS_PATH)
     except OSError:
         pass
@@ -475,11 +493,16 @@ def check_owner(uid: str, request: Request):
             detail=f"只能操作自己上传的任务（该任务来自 {owner}）")
 
 
-def list_active_uploads() -> list:
+def list_active_uploads(viewer_ip: str = "") -> list:
     """列出所有正在上传的任务（含进度/速度/来源），供其他设备同步显示。
 
     进度优先取客户端心跳上报的值；若客户端未上报（例如本机上传器
     刚创建任务），则回退读取 .info 里的 offset，保证一开始就能显示。
+
+    ``viewer_ip`` 为请求方地址，用于给每项打上 ``mine``：判断该任务是否由
+    **请求方这台电脑**发起。程序端（GUI）发起的上传，浏览器里没有任何记录，
+    仅凭前端自己记的 uid 无法识别，会把它误显示成"其他设备正在上传"，
+    所以归属必须由服务端判定后下发。
     """
     now = time.time()
     items = []
@@ -516,6 +539,10 @@ def list_active_uploads() -> list:
             "client_mac": device["mac"],
             "created_at": created,
             "elapsed": int(now - info["ts"]),
+            # 是否属于请求方这台电脑：本机上传器创建的任务所有者为 127.0.0.1，
+            # 浏览器从本机打开时两者都算本机，不应显示成"其他设备"；
+            # 手机访问时它确实属于另一台设备，仍然照常显示。
+            "mine": viewer_is_owner(uid, viewer_ip),
         })
     items.sort(key=lambda x: x["created_at"], reverse=True)
     return items
@@ -975,6 +1002,7 @@ button.mini[data-a="del"]{color:#ffb3bd;border-color:#5a3440}
   <h1>局域网文件传输</h1>
   <p class="sub" id="info">正在连接…</p>
   <p class="sz" id="paths" style="margin:-8px 0 12px"></p>
+  <p class="sz" id="speedBox" style="margin:-8px 0 12px"></p>
 
   <div class="card" id="remoteCard" hidden>
     <b>其他设备正在上传</b>
@@ -1075,6 +1103,13 @@ let maxParallel = 32;        // 当前并行上限
 let parallelLimitMax = 32;   // 服务端硬上限
 let maxParallelReady = false;
 
+/* 上传限速（字节/秒，0 = 无限制），与程序端下拉框同步；非 0 时最小 1 MB/s。
+   实现方式：每个分片请求前在 onBeforeRequest 里按「已传字节 / 目标速率」
+   算出应到的时刻，没到就延后——请求数与内存占用都不变，只是发送被节流。 */
+let speedLimit = 0;
+let speedMin = 1048576;
+const SPEED_CHOICES = [0, 1, 2, 5, 10, 20, 50, 100];   // MB/s，0 = 无限制
+
 function runningCount(){
   return TASKS.filter(t => t.status === STATE.UPLOADING).length;
 }
@@ -1115,15 +1150,30 @@ async function syncSettings(){
   let d;
   try { d = await (await fetch('/api/settings')).json(); } catch (e) { return; }
   const value = Number(d && d.max_parallel) || 32;
+  const speed = Number(d && d.speed_limit) || 0;
   parallelLimitMax = Number(d && d.limit) || 32;
-  if (value === maxParallel) { maxParallelReady = true; syncCards(); return; }
-  const changed = maxParallelReady;   // 首次同步不算「被程序端改动」，不弹提示
-  maxParallel = value;
-  maxParallelReady = true;
-  if (changed) {
-    applyParallelLimit();
-    toast('并行任务数已同步为 ' + value);
+  speedMin = Number(d && d.speed_min) || 1048576;
+
+  const first = !maxParallelReady;   // 首次同步不算「被程序端改动」，不弹提示
+  const notes = [];
+  if (value !== maxParallel) {
+    maxParallel = value;
+    if (!first) { applyParallelLimit(); notes.push('并行任务数 ' + value); }
   }
+  if (speed !== speedLimit) {
+    speedLimit = speed;
+    applySpeedSelect();
+    if (!first) notes.push(speed ? '限速 ' + (speed / 1048576) + ' MB/s' : '取消限速');
+  }
+  maxParallelReady = true;
+  syncCards();
+  if (notes.length) toast('已与电脑端同步：' + notes.join('、'));
+}
+
+/* 记录本次传输的限速基准：从当前已传字节重新计时（续传/暂停恢复后要重置） */
+function markRateStart(t){
+  t.rateBase = t.uploaded || 0;
+  t.rateStart = Date.now();
 }
 
 /* 记住"本标签页发起过的上传 ID"。
@@ -1285,6 +1335,7 @@ async function startTask(t){
   if (t.upload) {                     // 已创建过上传对象：直接续传
     t.status = STATE.UPLOADING;
     renderTask(t);
+    markRateStart(t);
     t.upload.start();
     startBeat(t);
     refreshPending();      // 立即刷新：恢复上传后该任务不应再出现在"未完成"
@@ -1319,7 +1370,20 @@ async function startTask(t){
   const opts = {
     endpoint: '/api/upload/',
     uploadUrl: t.resumeUrl || undefined,   // 指定则直接续传该任务
-    chunkSize: 32 * 1024 * 1024,
+    // 限速时把每个分片压到约 1 秒的数据量：发送更平滑，暂停/取消响应更快
+    chunkSize: speedLimit
+      ? Math.max(64 * 1024, Math.min(32 * 1024 * 1024, speedLimit))
+      : 32 * 1024 * 1024,
+    // 限速节流：tus-js-client 会 await 本回调，返回 Promise 即可延后本次请求
+    onBeforeRequest: () => new Promise((resolve) => {
+      if (!speedLimit) { resolve(); return; }
+      if (!t.rateStart) markRateStart(t);
+      const sent = Math.max(0, (t.uploaded || 0) - (t.rateBase || 0));
+      const waitMs = sent / speedLimit * 1000 - (Date.now() - t.rateStart);
+      if (waitMs <= 0) { resolve(); return; }
+      // 单次最多等 2 秒：不破坏长期平均速率，也不至于让暂停/取消迟迟不响应
+      setTimeout(resolve, Math.min(waitMs, 2000));
+    }),
     retryDelays: [0, 1000, 3000, 5000, 10000, 20000, 30000, 60000],
     // 不用浏览器指纹（localStorage）：它指向的旧任务可能已被删除，
     // 会导致 PATCH 404；续传统一以服务端 /api/pending 的结果为准
@@ -1388,6 +1452,7 @@ async function startTask(t){
   t.upload = new tus.Upload(t.file, opts);
   t.creating = false;
   renderTask(t);
+  markRateStart(t);
   t.upload.start();
   startBeat(t);
   setTimeout(refreshPending, 1200);
@@ -1460,8 +1525,10 @@ async function refreshRemote(){
     d = await (await fetch('/api/active')).json();
   } catch (e) { return; }
   // 自己的任务 = 当前页面上传中的 + 本标签页历史上传过的（刷新后仍在 sessionStorage）
+  //          + 服务端判定「属于本机」的（含程序端 GUI 发起的上传，
+  //            它们在浏览器里没有任何记录，只能靠服务端的 mine 字段识别）
   const mine = new Set([...TASKS.map(taskUid).filter(Boolean), ...myUids()]);
-  const items = (d.active || []).filter(a => !mine.has(a.uid));
+  const items = (d.active || []).filter(a => !mine.has(a.uid) && a.mine !== true);
   document.getElementById('remoteCard').hidden = items.length === 0;
   box.innerHTML = items.map(a => {
     const pct = a.size ? Math.min(100, a.uploaded / a.size * 100) : 0;
@@ -1685,6 +1752,37 @@ async function refreshPaths(){
   });
 }
 
+/* ---------------- 上传限速下拉框（与程序端同步） ---------------- */
+function buildSpeedBox(){
+  const box = document.getElementById('speedBox');
+  if (!box || box._built) return;
+  box._built = true;
+  const options = SPEED_CHOICES.map(m =>
+    '<option value="' + (m * 1048576) + '">'
+    + (m ? m + ' MB/s' : '无限制') + '</option>').join('');
+  box.innerHTML = '上传限速：<select id="speedSel" style="background:#262c4a;'
+    + 'border:1px solid #363d61;color:#cfd6f5;border-radius:6px;'
+    + 'padding:2px 6px;font-size:12.5px">' + options + '</select>'
+    + '<span style="margin-left:8px">（与电脑端同步，最小 1 MB/s）</span>';
+  document.getElementById('speedSel').onchange = async (ev) => {
+    const value = Number(ev.target.value) || 0;
+    const r = await apiFetch('/api/settings', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({speed_limit: value})
+    });
+    if (!r.ok) { toast(r.detail || '限速设置失败'); applySpeedSelect(); return; }
+    speedLimit = value;
+    toast(value ? '上传限速已设为 ' + (value / 1048576) + ' MB/s' : '已取消上传限速');
+  };
+  applySpeedSelect();
+}
+
+function applySpeedSelect(){
+  const sel = document.getElementById('speedSel');
+  if (sel) sel.value = String(speedLimit);
+}
+
 /* 刷新文件列表 */
 let lastFileSig = '';
 function fileSig(files){
@@ -1742,6 +1840,7 @@ refreshPending();
 refreshRemote();
 syncSettings();
 refreshPaths();
+buildSpeedBox();
 renderTips();
 setInterval(refresh, 3000);
 setInterval(refreshPending, 3000);
@@ -1962,28 +2061,64 @@ def create_app() -> FastAPI:
 
     @app.get("/api/settings")
     async def api_settings():
-        """当前并行任务上限。
+        """当前并行任务上限与上传限速（程序端与网页端共用）。
 
-        程序端下拉框与网页端排队逻辑共用这一个值：网页端每 2 秒轮询本接口，
-        发现数字变小就把超出名额的任务转成「排队中」，腾出名额后再自动续传。
+        网页端每 2 秒轮询本接口：并行数变小就把超出名额的任务转成「排队中」；
+        限速改变则立即用于后续分片请求。
         """
-        return {"max_parallel": PARALLEL["value"], "limit": PARALLEL_LIMIT_MAX}
+        return {
+            "max_parallel": PARALLEL["value"],
+            "limit": PARALLEL_LIMIT_MAX,
+            "speed_limit": SPEED_LIMIT["value"],   # 字节/秒，0 = 无限制
+            "speed_min": SPEED_LIMIT_MIN,          # 非 0 时的最小限速
+        }
 
     @app.post("/api/settings")
     async def api_set_settings(request: Request):
-        """修改并行任务上限（1 ~ PARALLEL_LIMIT_MAX），立即持久化。"""
+        """修改并行任务上限 / 上传限速，只处理请求里出现的字段，立即持久化。"""
         try:
             payload = await request.json()
-            value = int(payload.get("max_parallel"))
-        except (ValueError, TypeError, AttributeError):
-            raise HTTPException(status_code=400, detail="max_parallel 必须是整数")
-        if not 1 <= value <= PARALLEL_LIMIT_MAX:
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="请求体必须是 JSON 对象")
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="请求体必须是 JSON 对象")
+
+        updated = []
+        if "max_parallel" in payload:
+            try:
+                value = int(payload["max_parallel"])
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="max_parallel 必须是整数")
+            if not 1 <= value <= PARALLEL_LIMIT_MAX:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"max_parallel 需在 1~{PARALLEL_LIMIT_MAX} 之间")
+            PARALLEL["value"] = value
+            updated.append("max_parallel")
+
+        if "speed_limit" in payload:
+            try:
+                limit = int(payload["speed_limit"])
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="speed_limit 必须是整数")
+            # 0 表示无限制；非 0 时不得低于下限，也不接受负数
+            if limit < 0 or (limit and limit < SPEED_LIMIT_MIN):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"speed_limit 需为 0（无限制）或不小于 "
+                           f"{SPEED_LIMIT_MIN} 字节/秒")
+            SPEED_LIMIT["value"] = limit
+            updated.append("speed_limit")
+
+        if not updated:
             raise HTTPException(
                 status_code=400,
-                detail=f"max_parallel 需在 1~{PARALLEL_LIMIT_MAX} 之间")
-        PARALLEL["value"] = value
+                detail="请求里没有可更新的字段（max_parallel / speed_limit）")
+
         await asyncio.to_thread(save_settings)
-        return {"ok": True, "max_parallel": value}
+        return {"ok": True, "updated": updated,
+                "max_parallel": PARALLEL["value"],
+                "speed_limit": SPEED_LIMIT["value"]}
 
     @app.get("/api/space")
     async def api_space():
@@ -2079,11 +2214,16 @@ def create_app() -> FastAPI:
 
     @app.get("/api/active")
     async def api_active_list(request: Request):
-        """当前所有正在上传的任务（含进度与速度），供其它设备同步显示。"""
-        items = await asyncio.to_thread(list_active_uploads)
-        mine = request.query_params.get("exclude") or ""
-        if mine:
-            items = [i for i in items if i["uid"] != mine]
+        """当前所有正在上传的任务（含进度与速度），供其它设备同步显示。
+
+        每项带 ``mine``：以请求方视角看，该任务是否属于同一台电脑。
+        网页端据此过滤，避免把程序端本机上传的任务误报成"其他设备"。
+        """
+        viewer = request.client.host if request.client else ""
+        items = await asyncio.to_thread(list_active_uploads, viewer)
+        exclude = request.query_params.get("exclude") or ""
+        if exclude:
+            items = [i for i in items if i["uid"] != exclude]
         return {"active": items, "count": len(items)}
 
     @app.delete("/api/active/{uid}")

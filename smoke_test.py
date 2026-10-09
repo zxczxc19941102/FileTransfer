@@ -11,6 +11,8 @@
 6. 控制接口：/api/active 心跳、/api/pause、/api/resume、DELETE /api/pending
 7. 磁盘预检：声明超大 Upload-Length 应返回 507
 8. 并行任务数设置：默认值 / 设置 / 越界拒绝 / 持久化
+8.1 上传限速：接口边界校验（最小 1 MB/s、0 = 无限制）与持久化；
+    并按实际耗时验证程序端限速真的生效（2 MB 限速 1 MB/s 用时约 2 秒）
 9. 多个未完成任务必须**全部**返回（回归用例）
 10. 目录信息接口：路径齐全、目录真实存在；打开目录接口只放行白名单
 11. 本地文件删除后的列表同步：磁盘文件删掉后接口不再返回该条目；
@@ -398,7 +400,13 @@ def t_control():
           f"HTTP {status}")
 
     _, _, d = jreq("GET", "/api/active")
-    check("任务出现在 /api/active", any(a["uid"] == uid2 for a in d.get("active", [])))
+    item = next((a for a in d.get("active", []) if a["uid"] == uid2), None)
+    check("任务出现在 /api/active", item is not None)
+    # 请求来自 127.0.0.1，任务也是本机创建的：必须带 mine=true。否则程序端
+    # 本机上传在浏览器里没有任何记录，会被误显示成「其他设备正在上传」。
+    check("本机发起的任务在 /api/active 标记 mine=true",
+          item is not None and item.get("mine") is True,
+          f"mine={item.get('mine') if item else 'N/A'}")
 
     status, _, d = jreq("POST", f"/api/pause/{uid2}")
     check("请求暂停 200", status == 200 and d.get("ok") is True, f"HTTP {status}")
@@ -430,6 +438,70 @@ def t_disk_guard():
         "Tus-Resumable": "1.0.0", "Upload-Length": str(huge),
         "Upload-Metadata": meta_header("超大盘测试.bin")})
     check("空间不足时返回 507", status == 507, f"HTTP {status}（需要 {huge} 字节）")
+
+
+def t_speed_limit():
+    """上传限速：接口校验 + 程序端限速真的生效（按耗时实测）。"""
+    print("\n== 6.1 上传限速 ==")
+    _, _, d = jreq("GET", "/api/settings")
+    check("设置接口返回限速字段（默认 0 = 无限制）",
+          d.get("speed_limit") == 0 and d.get("speed_min") == 1 << 20,
+          f"speed_limit={d.get('speed_limit')} speed_min={d.get('speed_min')}")
+
+    status, _, r = jreq("POST", "/api/settings",
+                        body=json.dumps({"speed_limit": 2 << 20}).encode(),
+                        headers={"Content-Type": "application/json"})
+    check("单独设置限速（不传并行数）成功",
+          status == 200 and r.get("speed_limit") == 2 << 20, f"HTTP {status} {r}")
+
+    # 小于 1 MB/s 或负数一律拒绝；0 表示取消限速
+    for value in (-1, 1024, (1 << 20) - 1):
+        status, _, _ = jreq("POST", "/api/settings",
+                            body=json.dumps({"speed_limit": value}).encode(),
+                            headers={"Content-Type": "application/json"})
+        check(f"限速值 {value} 被拒绝（400，最小 1 MB/s）", status == 400,
+              f"HTTP {status}")
+    status, _, r = jreq("POST", "/api/settings",
+                        body=json.dumps({"speed_limit": 0}).encode(),
+                        headers={"Content-Type": "application/json"})
+    check("限速设为 0（无限制）成功", status == 200 and r.get("speed_limit") == 0,
+          f"HTTP {status}")
+
+    try:
+        with open(os.path.join(UPLOAD_DIR, ".settings.json"), encoding="utf-8") as fp:
+            saved = json.load(fp)
+        check("限速值已持久化到磁盘", "speed_limit" in saved, str(saved))
+    except (OSError, ValueError) as exc:
+        bad("限速值已持久化到磁盘", repr(exc))
+
+    # ---- 程序端限速真的生效：2 MB 文件限速 1 MB/s，耗时应接近 2 秒 ----
+    sys.path.insert(0, BASE)
+    import uploader
+
+    src = os.path.join(TMP_DIR, "冒烟测试-限速.bin")
+    size = 2 * 1024 * 1024
+    make_blob(src, size)
+
+    def run_task(limit_bps: int):
+        task = uploader.UploadTask(src, PORT, chunk_size=size)
+        task.limit_bps = limit_bps
+        began = time.time()
+        task.start()
+        while time.time() - began < 40 and task.status not in ("done", "failed"):
+            time.sleep(0.05)
+        return task, time.time() - began
+
+    task, slow = run_task(1 << 20)                 # 1 MB/s
+    check("限速 1 MB/s 上传 2 MB 耗时约 2 秒（≥1.8 秒）",
+          task.status == "done" and slow >= 1.8,
+          f"status={task.status} 用时 {slow:.2f}s err={task.error}")
+
+    task2, fast = run_task(0)                      # 不限速
+    check("取消限速后同样内容明显更快（<1 秒）",
+          task2.status == "done" and fast < 1.0,
+          f"status={task2.status} 用时 {fast:.2f}s")
+    check("限速确实拖慢了上传", slow > fast * 1.5,
+          f"限速 {slow:.2f}s vs 不限速 {fast:.2f}s")
 
 
 def t_parallel_settings():
@@ -1006,6 +1078,7 @@ def main():
         t_control()
         t_disk_guard()
         t_parallel_settings()
+        t_speed_limit()
         t_pending_multi()
         t_paths_and_open()
         t_file_removal_sync()

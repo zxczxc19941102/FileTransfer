@@ -40,6 +40,9 @@ QR_PATH = os.path.join(BASE_DIR, "lan_qrcode.png")
 SERVER_IP = "127.0.0.1"   # 启动后写入真实内网 IP
 SERVER_PORT = 8000        # 启动后写入真实端口
 
+# 上传限速下拉可选值（MB/s），0 = 无限制；与网页端的 SPEED_CHOICES 保持一致
+SPEED_CHOICES_MB = (0, 1, 2, 5, 10, 20, 50, 100)
+
 
 def ensure_std_streams():
     """打包成无控制台 exe 后 stdout/stderr 为 None，print 会抛异常，这里兜底。"""
@@ -184,14 +187,15 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
 
     from PIL import Image, ImageTk
 
-    from store import (LOG_DIR, PARALLEL_LIMIT_MAX, SETTINGS_PATH, UPLOAD_DIR,
-                       human_size, list_active_uploads, local_machine_info,
-                       meta_path, read_all_meta, scan_pending_uploads)
+    from store import (LOG_DIR, PARALLEL_LIMIT_MAX, SETTINGS_PATH,
+                       SPEED_LIMIT_MIN, UPLOAD_DIR, human_size,
+                       list_active_uploads, local_machine_info, meta_path,
+                       read_all_meta, scan_pending_uploads)
     from uploader import UploadTask, load_local_tasks, save_local_tasks
 
     root = tk.Tk()
     root.title("局域网文件传输工具 - 电脑端")
-    root.geometry("900x860")
+    root.geometry("900x890")
     root.configure(bg="#0f1220")
     machine = local_machine_info()
 
@@ -550,21 +554,46 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
     if not 1 <= parallel["value"] <= parallel_max:
         parallel["value"] = parallel_max
 
+    # 上传限速：0 = 无限制，非 0 时最小 1 MB/s；与并行数一样写回服务端共用
+    speed = {"value": 0}
+    if ok and isinstance(cfg, dict):
+        speed["value"] = int(cfg.get("speed_limit") or 0)
+    speed_items = [(0, "无限制")] + [(n << 20, f"{n} MB/s")
+                                     for n in SPEED_CHOICES_MB[1:]]
+    speed_by_label = {label: value for value, label in speed_items}
+    speed_labels = [label for _value, label in speed_items]
+    if speed["value"] not in speed_by_label.values():
+        # 服务端存着一个不在下拉列表里的值（例如被接口直接设成 3 MB/s）：
+        # 临时补进候选项，免得下拉框显示空白让人以为限速没了
+        extra = f"{speed['value'] / 1048576:g} MB/s"
+        speed_labels.insert(1, extra)
+        speed_by_label[extra] = speed["value"]
+
     up_head = tk.Frame(root, bg="#0f1220")
     up_head.pack(fill="x", padx=14, pady=(8, 2))
     tk.Label(up_head, text="从本机上传（分片 · 断点续传 · 可暂停继续；右键：继续 / 下载 / 暂停 / 删除）",
              bg="#0f1220", fg="#eef1ff",
              font=("微软雅黑", 10, "bold")).pack(side="left")
-    par_box = tk.Frame(up_head, bg="#0f1220")
-    par_box.pack(side="right")
-    tk.Label(par_box, text="并行任务数", bg="#0f1220", fg="#9aa3c7",
+
+    up_opts = tk.Frame(root, bg="#0f1220")
+    up_opts.pack(fill="x", padx=14)
+    tk.Label(up_opts, text="并行任务数", bg="#0f1220", fg="#9aa3c7",
              font=("微软雅黑", 9)).pack(side="left")
-    parallel_box = ttk.Combobox(par_box, width=4, state="readonly",
+    parallel_box = ttk.Combobox(up_opts, width=4, state="readonly",
                                 justify="center",
                                 values=[str(n) for n in range(1, parallel_max + 1)])
     parallel_box.set(str(parallel["value"]))
-    parallel_box.pack(side="left", padx=(6, 0))
+    parallel_box.pack(side="left", padx=(6, 16))
     parallel_box.bind("<<ComboboxSelected>>", lambda _e: on_parallel_change())
+
+    tk.Label(up_opts, text="上传限速", bg="#0f1220", fg="#9aa3c7",
+             font=("微软雅黑", 9)).pack(side="left")
+    speed_box = ttk.Combobox(up_opts, width=9, state="readonly",
+                             justify="center", values=speed_labels)
+    speed_box.set(next(label for label, value in speed_by_label.items()
+                       if value == speed["value"]))
+    speed_box.pack(side="left", padx=(6, 0))
+    speed_box.bind("<<ComboboxSelected>>", lambda _e: on_speed_change())
 
     up_frame = ttk.Frame(root)
     up_frame.pack(fill="x", padx=14)
@@ -664,9 +693,55 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
         status_var.set(f"并行任务数已设为 {parallel['value']}，网页端会自动同步"
                        if ok else f"⚠ 并行任务数未能同步到服务端：{msg}")
 
+    def on_speed_change():
+        """限速下拉框改动：写回服务端（网页端会自动同步），并作用于全部本机任务。
+
+        正在上传的任务也会立即生效——限速值由发送循环每轮读取，
+        不需要停下来重启任务。数值没变化时直接返回，避免重复写盘。
+        """
+        value = speed_by_label.get(speed_box.get())
+        if value is None or value == speed["value"]:
+            return
+        speed["value"] = value
+        ok, msg = api_call("POST", "/api/settings", {"speed_limit": value})
+        for rec in tasks.values():
+            rec["task"].limit_bps = value
+        status_var.set(f"上传限速已设为 {speed_box.get()}，网页端会自动同步"
+                       if ok else f"⚠ 上传限速未能同步到服务端：{msg}")
+
+    def sync_settings_from_server():
+        """跟随服务端设置：网页端改过并行数 / 限速时，程序端也要跟着变。
+
+        与网页端每 2 秒轮询 /api/settings 对称。缺了这一步，两端各持一份
+        副本，会出现"程序端写着 32、实际按 2 跑"这类不一致。
+        """
+        ok, cfg = api_call("GET", "/api/settings")
+        if not ok or not isinstance(cfg, dict):
+            return
+        value = int(cfg.get("max_parallel") or 0)
+        limit = int(cfg.get("speed_limit") or 0)
+        if value and value != parallel["value"]:
+            parallel["value"] = max(1, min(parallel_max, value))
+            parallel_box.set(str(parallel["value"]))
+            apply_parallel_limit()
+            status_var.set(f"并行任务数已同步为 {parallel['value']}")
+        if limit != speed["value"]:
+            speed["value"] = limit
+            for rec in tasks.values():
+                rec["task"].limit_bps = limit
+            label = next((lbl for lbl, val in speed_by_label.items()
+                          if val == limit), None)
+            if label is None:
+                label = f"{limit / 1048576:g} MB/s"
+                speed_by_label[label] = limit
+                speed_box.configure(values=list(speed_by_label))
+            speed_box.set(label)
+            status_var.set(f"上传限速已同步为 {label}")
+
     def add_task(path: str, state: str = "waiting", uploaded: int = 0, iid: str = ""):
         """新建（或恢复）一个本机上传任务；传入 iid 表示复用原行，不新增条目。"""
         task = UploadTask(path, port)
+        task.limit_bps = speed["value"]      # 新建任务沿用当前的限速设置
         iid = iid or task.iid
         try:
             mtime = os.path.getmtime(path)
@@ -958,8 +1033,9 @@ def run_gui(url: str, qr_path: str, port: int, server) -> None:
         """
         try:
             refresh_tree()
+            sync_settings_from_server()
         except Exception as exc:
-            report_gui_error(f"刷新文件列表失败：{exc}")
+            report_gui_error(f"刷新界面失败：{exc}")
         finally:
             root.after(2000, tick)
 
